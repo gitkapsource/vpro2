@@ -35,24 +35,14 @@ DEEPGRAM_API_KEY = "8451356dec473b846cb24b5dd8e275b2aa2c4a56"
 call_sessions = {}
 rtp_sessions = {}
 
-
-# (ip,port) -> channel_id
-# call_sessions[channel_id] = {
-#     "bridge_id": bridge_id,
-#     "caller_channel": channel_id,
-#     "voicebot_channel": None,
-#     "transcript": "",
-#     "stt_ws": websocket
-# }
-
 keywords_list = {
         "block",
         "balance",
         "inquiry",
         "card services",
-        "rewarding",
-        "account",
-        "automated"
+        "rewarding"
+        # "account",
+        # "automated"
 }
 
 def fuzzy_match(transcript, keywords, session):
@@ -288,39 +278,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     #llm_response = generate_llm_reply(transcript_text)
 
-    # Digits Tag
-
-    # expected_prompt = "Your account number is {digits length=8,10} Thank you"
-    # transcript_text = "Your account number is 12345678 Thank you"
-
-    # Choice Tag
-
-    # expected_prompt = "this is {choice x=alex:agent1|john:agent2|mary:agent3} speaking"
-    # transcript_text = "this is mary speaking"
-
-    # Number Tag
-    
-    # expected_prompt = "There are {Number} products available"
-    # transcript_text = "There are One Thousand and Four products available"
-    # transcript_text = "There are -6,5489.56 products available"
-
-    # Date Tag
-    
-    # expected_prompt = "The school holidays will start on {Date}"
-    # transcript_text = "The school holidays will start on Tomorrow"
-
-    # Time Tag
-    
-    expected_prompt = "At the third tone the time will be {Time} precisely"
-    transcript_text = "At the third tone the time will be 12:24pm precisely"
-
-
-    #expected_prompt = "{Ignore}welcome to the automated ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
+    expected_prompt = "{Ignore}welcome to the automated ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
     #nodedata_match = match_nodedata(expected_prompt, transcript_text)
 
-    result = engine.process(expected_prompt,transcript_text)
+    result = validate_prompts(expected_prompt,transcript_text)
 
-    print("Tag Match Result: ", result)      
+    #print("Tag Match Result: ", result)      
 
     #write_transcript(parent_channel_id, "KCAI", llm_response)
 
@@ -334,8 +297,24 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     # OR
 
-    #send_dtmf(channel_id, "1")
+    session = call_sessions[parent_channel_id]
 
+    if session:
+
+        print("Session Object: ",session)
+        session["ivr_step_number"] += 1
+
+        if session["ivr_step_number"] == 1:
+             send_dtmf(channel_id, "2")
+        elif session["ivr_step_number"] == 2:
+             send_dtmf(channel_id, "3")
+        else:
+            send_dtmf(channel_id, "1")
+
+        print("IVR Step Number:", session["ivr_step_number"])
+    else:
+        print("Session Not Found for IVR Traversal") 
+        
 def match_nodedata(expected_prompt, actual_prompt):
 
     # Entire sentence similarity
@@ -459,14 +438,15 @@ def synthesize_speech_polly(text, base_filename):
 
 def play_audio(channel_id, sound):
 
-    print("Audio playback:", sound)
+    print("Audio playback for DTMF check:", sound)
 
-    requests.post(
+    r= requests.post(
         f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
         auth=(ARI_USER, ARI_PASS),
         json={"media": f"sound:{sound}"}
     )
 
+    print("beep response:", r)
 
 def play_audio_bridge(channel_id, sound):
 
@@ -488,16 +468,18 @@ def play_audio_bridge(channel_id, sound):
 
 def send_dtmf(channel_id, digits):
 
-    url = f"{ASTERISK_URL}/channels/{channel_id}/dtmf"
+    print("Sending DTMF :", digits, " on channel:", channel_id)
+    url = f"{ASTERISK_URL}/ari/channels/{channel_id}/dtmf"
 
     params = {
         "dtmf": digits,
         "before": 0,
         "between": 200,
-        "duration": 200
+        "duration": 500
     }
 
-    requests.post(url, params=params, auth=(ARI_USER, ARI_PASS))
+
+    print("Response: ", requests.post(url, params=params, auth=(ARI_USER, ARI_PASS)))
 
 ################################################
 # ARI FUNCTIONS
@@ -508,7 +490,7 @@ def create_bridge():
     r = requests.post(
         f"{ASTERISK_URL}/ari/bridges",
         auth=(ARI_USER, ARI_PASS),
-        params={"type": "mixing"}
+        params={"type": "mixing,dtmf_events"}
     )
 
     bridge = r.json()
@@ -679,7 +661,8 @@ def on_ari(ws, message):
             "bot_last_rtp_time":0,
             "bot_rtp_start_time":0,
             "bot_avg_latency":0,
-            "keywords_matched":[]
+            "keywords_matched":[],
+            "ivr_step_number":0
         }
 
         open(transcript_file, "a").write(f"CALL START {timestamp}\n")
@@ -786,24 +769,22 @@ def cleanup_call(channel_id):
 ################################################
 # TEMPORARY TAG MATCH LOGIC [ REMOVE THIS FOR PRODUCTION ]
 ################################################
-def tag_match():
-
-    expect_to_hear="Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
-    #actual="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
-    actual="Yo you Buddy fdsfdsf jkfjdsklfjldskf"
+def validate_prompts(expect_to_hear:str, actual_prompt:str):
 
     result = validate(
         expect_to_hear,
-        actual,
+        actual_prompt,
         language="en-US"   # en-AU, en-GB, es-US, nl-NL, ja-JP
     )
     print("=====================================================")
     print("Expect to Hear:",expect_to_hear)
-    print("Actual Prompt:",actual)
+    print("Actual Prompt:",actual_prompt)
     print("Matched: ",result.matched)
     print("Match %:",result.match_percentage)
     #print("FULL RESULT:\n",result)
     print("=====================================================")
+
+    return result
     
 
 ################################################
@@ -815,7 +796,11 @@ def main():
     print("Starting Voicebot")
 
     # TEMPORARY TAG MATCH CHECK [ REMOVE FOR PRODUCTION ]
-    tag_match()
+    expect_to_hear="Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
+    actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
+    # actual_prompt="Yo you Buddy fdsfdsf jkfjdsklfjldskf"
+
+    # result = validate_prompts(expect_to_hear, actual_prompt)
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
