@@ -303,15 +303,58 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
         print("Session Object: ",session)
         session["ivr_step_number"] += 1
+    
+        if session["dialed_extension"] == "1000":
 
-        if session["ivr_step_number"] == 1:
-             send_dtmf(channel_id, "2")
-        elif session["ivr_step_number"] == 2:
-             send_dtmf(channel_id, "3")
-        else:
-            send_dtmf(channel_id, "1")
+            if session["ivr_step_number"] == 1:
+                send_dtmf(channel_id, "1")
+            elif session["ivr_step_number"] == 2:
+                send_dtmf(channel_id, "1")
+            else:
+                send_dtmf(channel_id, "1")
+                print("Final Traversal: 1 | 1 | 1")
 
-        print("IVR Step Number:", session["ivr_step_number"])
+            print("IVR Step Number:", session["ivr_step_number"])
+        
+        elif session["dialed_extension"] == "2000":
+
+            if session["ivr_step_number"] == 1:
+                send_dtmf(channel_id, "2")
+            elif session["ivr_step_number"] == 2:
+                send_dtmf(channel_id, "3")
+            else:
+                send_dtmf(channel_id, "1")
+                print("Final Traversal: 2 | 3 | 1")
+
+        elif session["dialed_extension"] == "3000":
+            if session["ivr_step_number"] == 1:
+                play_audio(channel_id, "beep")
+            elif session["ivr_step_number"] == 2:
+                play_audio(channel_id, "beep")
+            else:
+                play_audio(channel_id, "beep")
+
+        elif session["dialed_extension"] == "4000":
+            if session["ivr_step_number"] == 1:
+                reply_path = synthesize_speech_polly("I would go for 1", base_filename)
+                play_audio(channel_id, base_filename)
+            elif session["ivr_step_number"] == 2:
+                reply_path = synthesize_speech_polly("I would go for 2", base_filename)
+                play_audio(channel_id, base_filename)
+            else:
+                reply_path = synthesize_speech_polly("I would go for 3", base_filename)
+                play_audio(channel_id, base_filename)
+
+        elif session["dialed_extension"] == "5000":
+            if session["ivr_step_number"] == 1:
+                play_silence(channel_id, 3)
+            elif session["ivr_step_number"] == 2:
+                play_silence(channel_id, 5)
+            else:
+                play_silence(channel_id, 4)
+
+            print("IVR Step Number:", session["ivr_step_number"])
+
     else:
         print("Session Not Found for IVR Traversal") 
         
@@ -448,6 +491,20 @@ def play_audio(channel_id, sound):
 
     print("beep response:", r)
 
+def play_silence(channel_id, seconds):
+
+    print(f"Playing {seconds} seconds of silence")
+
+    r = requests.post(
+        f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
+        auth=(ARI_USER, ARI_PASS),
+        json={"media": f"sound:silence/{seconds}"}
+    )
+
+    print("Silence playback response:", r.status_code, r.text)
+
+    return r
+
 def play_audio_bridge(channel_id, sound):
 
     session = call_sessions[channel_id]
@@ -477,7 +534,6 @@ def send_dtmf(channel_id, digits):
         "between": 200,
         "duration": 500
     }
-
 
     print("Response: ", requests.post(url, params=params, auth=(ARI_USER, ARI_PASS)))
 
@@ -579,7 +635,7 @@ def dial_voicebot(channel_id):
 def on_ari(ws, message):
 
     event = json.loads(message)
-    #print("Incoming Event Type:", event)
+    # print("Incoming Event Type:", event)
 
     if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
         #print("This is ;2 leg, ignore")
@@ -633,6 +689,13 @@ def on_ari(ws, message):
     if event["type"] != "StasisStart":
         return
     
+    #  # Extension that was dialed
+    context = event["channel"]["dialplan"]["context"]
+    exten = event["channel"]["dialplan"]["exten"]
+
+    print(f"Dialed Extension: {exten}")
+    print(f"Context: {context}")
+
     if parent_channel is None:
 
         play_audio(channel_id, "beep")
@@ -650,6 +713,7 @@ def on_ari(ws, message):
         ext_media = create_external_media()
         
         call_sessions[channel_id] = {
+            "dialed_extension": exten,
             "caller_channel": channel_id,
             "bridge_id": bridge_id,
             "voicebot_channel": None,
