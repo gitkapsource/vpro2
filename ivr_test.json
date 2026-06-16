@@ -1,0 +1,51 @@
+{
+  "meta": {
+    "test_execution_row_id": 12458,
+    "phone_to_dial": "+18005550199",
+    "execution_mode": 1,
+    "compiled_at": "2026-06-01 09:15:00"
+  },
+  "dial_plan": {
+    "node_101": {
+      "node_type": "Prompt",
+      "expected_text": "Welcome to Assure Bank.",
+      "expected_silence": 3.00,
+      "timeout": 10,
+      "action_to_take": null,
+      "transitions": {
+        "on_success": "node_102",
+        "on_timeout": "node_fail_hangup",
+        "on_mismatch": "node_102"
+      }
+    },
+    "node_102": {
+      "node_type": "Menu",
+      "expected_text": "For existing account service press 1, for new accounts press 2.",
+      "expected_silence": 2.50,
+      "timeout": 8,
+      "action_to_take": {
+        "inject_type": "DTMF",
+        "value": "1"
+      },
+      "transitions": {
+        "on_success": "node_105",
+        "on_timeout": "node_fail_hangup"
+      }
+    },
+    "node_105": {
+      "node_type": "Data Capture",
+      "expected_text": "Please enter your sixteen digit account number.",
+      "expected_silence": 3.00,
+      "timeout": 12,
+      "action_to_take": {
+        "inject_type": "DTMF",
+        "value": "4524889012345562"
+      },
+      "transitions": {
+        "on_success": "node_106",
+        "on_error_branch": "node_107",
+        "on_timeout": "node_fail_hangup"
+      }
+    }
+  }
+}
