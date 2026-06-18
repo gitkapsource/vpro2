@@ -8,11 +8,14 @@ class Action:
     inject_type: str
     value: str
 
+@dataclass
+class Extended_Attributes:
+    lookup_by_column: str
+    output_states: str
 
 @dataclass
 class Transitions:
     transitions: Dict[str, str]
-
 
 @dataclass
 class Node:
@@ -23,7 +26,13 @@ class Node:
     timeout: int
     action_to_take: Optional[Action]
     transitions: Dict[str, str]
-
+    language_ids: str
+    persona: str
+    minor_threshold_time: float
+    major_threshold_time: float
+    minor_confidence_level: float
+    major_confidence_level: float
+    extended_attributes: Optional[Extended_Attributes]
 
 @dataclass
 class Meta:
@@ -32,12 +41,46 @@ class Meta:
     execution_mode: int
     compiled_at: str
 
+@dataclass
+class TestModelSettings:
+    language_ids: str
+    persona: str
+    minor_threshold_time: float
+    major_threshold_time: float
+    minor_confidence_level: float
+    major_confidence_level: float
+    extended_attributes: Optional[Extended_Attributes]
 
 class IVRTestCase:
 
     def __init__(self, json_data):
 
         self.meta = Meta(**json_data["meta"])
+
+        # Test Model Settings
+
+        extended_attributes = None
+
+        if json_data.get("extended_attributes"):
+
+            extended_attributes = Extended_Attributes(
+                lookup_by_column=json_data["extended_attributes"]["lookup_by_column"],
+                output_states=json_data["extended_attributes"]["output_states"]
+            )
+
+        test_model_settings = TestModelSettings(
+            language_ids=json_data["language_ids"],
+            persona=json_data["persona"],
+            minor_threshold_time=json_data["minor_threshold_time"],
+            major_threshold_time=json_data["major_threshold_time"],
+            minor_confidence_level=json_data["minor_confidence_level"],
+            major_confidence_level=json_data["major_confidence_level"],
+            extended_attributes=extended_attributes
+        )
+
+        self.test_model_settings = test_model_settings
+
+        # Data Nodes
 
         self.nodes = {}
 
@@ -52,6 +95,16 @@ class IVRTestCase:
                     value=node_data["action_to_take"]["value"]
                 )
 
+            extended_attributes = None
+
+            if node_data.get("extended_attributes"):
+
+                extended_attributes = Extended_Attributes(
+                    lookup_by_column=node_data["extended_attributes"]["lookup_by_column"],
+                    output_states=node_data["extended_attributes"]["output_states"]
+                )
+
+
             node = Node(
                 node_id=node_id,
                 node_type=node_data["node_type"],
@@ -59,7 +112,15 @@ class IVRTestCase:
                 expected_silence=node_data["expected_silence"],
                 timeout=node_data["timeout"],
                 action_to_take=action,
+                language_ids=node_data["language_ids"],
+                persona=node_data["persona"],
+                minor_threshold_time=node_data["minor_threshold_time"],
+                major_threshold_time=node_data["major_threshold_time"],
+                minor_confidence_level=node_data["minor_confidence_level"],
+                major_confidence_level=node_data["major_confidence_level"],
+                extended_attributes=extended_attributes,
                 transitions=node_data.get("transitions", {})
+
             )
 
             self.nodes[node_id] = node
@@ -89,6 +150,15 @@ def main():
 
         print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
         print("_" * 100)
+        print("Language IDs:", test_case.test_model_settings.language_ids)
+        print("Persona:", test_case.test_model_settings.persona)
+        print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
+        print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
+        print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
+        print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
+
+        if test_case.test_model_settings.extended_attributes:
+            print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
 
         # node = test_case.get_node("node_102")
 
@@ -114,6 +184,16 @@ def main():
         if current_node.action_to_take:
             print("INJECT TYPE: ", current_node.action_to_take.inject_type)
             print("ACTION DATA: ", current_node.action_to_take.value)
+
+        print("Language IDs:", current_node.language_ids)
+        print("Persona:", current_node.persona)
+        print("Minor Threshold Time:", current_node.minor_threshold_time)
+        print("Major Threshold Time:", current_node.major_threshold_time)
+        print("Minor Confidence Level:", current_node.minor_confidence_level)
+        print("Major Confidence Level:", current_node.major_confidence_level)
+
+        if current_node.extended_attributes:
+            print("Extended Attributes:", current_node.extended_attributes)
 
         print("TRANSITIONS: ",current_node.transitions)
    

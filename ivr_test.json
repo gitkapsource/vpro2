@@ -5,6 +5,16 @@
     "execution_mode": 1,
     "compiled_at": "2026-06-01 09:15:00"
   },
+  "language_ids": "1",
+  "persona": null,
+  "minor_threshold_time": 3.00,
+  "major_threshold_time": 5.00,
+  "minor_confidence_level": 70,
+  "major_confidence_level": 35,
+  "extended_attributes": {
+  "lookup_by_column": "Account Number",
+  "output_states": ["Success", "Error"]
+  },
   "dial_plan": {
     "node_101": {
       "node_type": "Prompt",
@@ -16,7 +26,16 @@
         "on_success": "node_102",
         "on_timeout": "node_fail_hangup",
         "on_mismatch": "node_102"
-      }
+      },
+      "language_ids": "1",
+      "persona": {
+        "1": {"VT": "M", "VI": "Joey", "VS": "medium", "VP": "medium"}
+      },
+      "minor_threshold_time": 3.00,
+      "major_threshold_time": 5.00,
+      "minor_confidence_level": 80,
+      "major_confidence_level": 50,
+      "extended_attributes": null
     },
     "node_102": {
       "node_type": "Menu",
@@ -30,7 +49,17 @@
       "transitions": {
         "on_success": "node_105",
         "on_timeout": "node_fail_hangup"
-      }
+      },
+      "language_ids": "1,2",
+      "persona": {
+        "1": {"VT": "M", "VI": "Joey", "VS": "medium", "VP": "medium"},
+        "2": {"VT": "F", "VI": "Penelope", "VS": "medium", "VP": "medium"}
+      },
+      "minor_threshold_time": 3.00,
+      "major_threshold_time": 5.00,
+      "minor_confidence_level": 80,
+      "major_confidence_level": 50,
+      "extended_attributes": null
     },
     "node_105": {
       "node_type": "Data Capture",
@@ -45,7 +74,18 @@
         "on_success": "node_106",
         "on_error_branch": "node_107",
         "on_timeout": "node_fail_hangup"
+      },
+      "language_ids": "1",
+      "persona": null,
+      "minor_threshold_time": 3.00,
+      "major_threshold_time": 5.00,
+      "minor_confidence_level": 70,
+      "major_confidence_level": 35,
+      "extended_attributes": {
+        "lookup_by_column": "Account Number",
+        "output_states": ["Success", "Error"]
       }
+
     }
   }
 }
