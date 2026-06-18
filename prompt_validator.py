@@ -15,11 +15,11 @@ Supported tags (any combination):
   {Choice a|b|c}             One of several alternatives
   {Choice x=a:1|b:2|c:3}    Choice with variable capture → result.captured_variables
   {Optional text}            Phrase is optional (not scored)
-  {*}                        Wildcard — absorbs text up to the next anchor
+  {*} / {wildcard}           Wildcard — absorbs text up to the next anchor (both spellings are identical)
   {BypassRecognition}        Always returns 100% match, ignores everything after it
 
 match_percentage = matched_units / total_units × 100
-  • {Optional} and {*} are not counted in total_units
+  • {Optional} and {*}/{wildcard} are not counted in total_units
   • {BypassRecognition} short-circuits to 100% immediately
   • Choice variable=value pairs are returned in result.captured_variables
 """
@@ -230,7 +230,7 @@ def _tag_to_regex(tag: str, language: str) -> str:
     t  = tag.strip()
     tu = t.upper()
 
-    if t == "*":
+    if t == "*" or tu == "WILDCARD":
         return r"(?:.*?)"
     if tu == "DATE":
         return _DATE
@@ -354,7 +354,7 @@ def _extract_scored_units(template: str, language: str) -> list:
             })
             break   # nothing after BypassRecognition is scored
 
-        is_optional = tu.startswith("OPTIONAL") or t == "*"
+        is_optional = tu.startswith("OPTIONAL") or t == "*" or tu == "WILDCARD"
 
         # Digits with length constraints
         md = re.match(r"DIGITS(?:\s+LENGTH=(\d+)(?:-(\d+))?)?$", tu)
@@ -402,9 +402,9 @@ def _extract_scored_units(template: str, language: str) -> list:
             continue
 
         # Wildcard
-        if t == "*":
+        if t == "*" or tu == "WILDCARD":
             units.append({
-                "label":    "{*}",
+                "label":    "{" + t + "}",
                 "regex":    re.compile(r".*?", re.IGNORECASE),
                 "optional": True,
                 "kind":     "tag",
@@ -769,6 +769,16 @@ def _run_tests():
         ("Account {Digits Length=4} {*} expires {Date}",
          "Account 1 2 3 4 NOISE expires tomorrow", "en-US", True, 100.0, {}),
 
+        # ── {wildcard} as alias for {*} ──────────────────────────────────────
+        ("{wildcard} Your balance is {Currency} rupees",
+         "Your balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Hello {wildcard} balance is {Currency} rupees",
+         "Hello sir balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Call {Wildcard} on {Date} at {Time}",
+         "Call us on June 4th at 9:30am", "en-US", True, 100.0, {}),
+        ("Your PIN is {Digits Length=4} {WILDCARD}",
+         "Your PIN is 1 2 3 4 extra stuff", "en-US", True, 100.0, {}),
+
         # ── Combinations ─────────────────────────────────────────────────────
         ("Your PIN is {Digits Length=4} and your account ends in {Digits Length=4}",
          "Your PIN is 1 2 3 4 and your account ends in 5 6 7 8", "en-US", True, 100.0, {}),
@@ -837,10 +847,12 @@ Usage:
 IMPORTANT: Always quote the template and actual text.
 
 Supported language codes: en-US (default), en-AU, en-GB, es-US, nl-NL
+Note: {*} and {wildcard} are interchangeable — both mean the same thing.
 
 Examples:
   python prompt_validator.py "Your PIN is {Digits Length=4}" "Your PIN is 1 2 3 4"
   python prompt_validator.py "{*} from {Date} to {Date}" "Flights from June 4th to June 10th"
+  python prompt_validator.py "{wildcard} from {Date} to {Date}" "Flights from June 4th to June 10th"
   python prompt_validator.py "Balance is {Currency}" "Balance is two pounds" en-GB
   python prompt_validator.py "{BypassRecognition}" "any audio"
 """

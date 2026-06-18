@@ -12,8 +12,7 @@ import audioop
 from groq import Groq
 from rapidfuzz import fuzz
 from prompt_validator import validate
-
-
+import mysql.connector
 import re
 from difflib import SequenceMatcher
 
@@ -278,7 +277,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     #llm_response = generate_llm_reply(transcript_text)
 
-    expected_prompt = "{Ignore}welcome to the automated ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
+    expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
     #nodedata_match = match_nodedata(expected_prompt, transcript_text)
 
     result = validate_prompts(expected_prompt,transcript_text)
@@ -286,20 +285,20 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
     #print("Tag Match Result: ", result)      
 
     #write_transcript(parent_channel_id, "KCAI", llm_response)
-
     #print("Let's generate TTS\n")
-
     #reply_path = synthesize_speech_polly(llm_response, base_filename)
-
     #play_audio(channel_id, base_filename)
-
     #play_audio_bridge(parent_channel_id, base_filename)
-
     # OR
 
     session = call_sessions[parent_channel_id]
 
     if session:
+
+        print("Session Captured Variables:",session["captured_variables"])
+
+        if (result.captured_variables and any(result.captured_variables.values())):
+            session["captured_variables"].update(result.captured_variables)
 
         print("Session Object: ",session)
         session["ivr_step_number"] += 1
@@ -665,9 +664,30 @@ def on_ari(ws, message):
     channel_name = event["channel"]["name"]
 
     if event["type"] == "StasisEnd":
+
         #channel_id = event["channel"]["id"]
         print("Channel left Stasis:", channel_id)
-        cleanup_call(channel_id)
+
+        # Let's find the session for the channel_id
+        session = call_sessions.get(channel_id)
+
+        if not session:
+            # maybe the voicebot channel triggered it
+            for cid, s in call_sessions.items():
+                if s.get("voicebot_channel") == channel_id:
+                    session = s
+                    channel_id = cid
+                    break
+
+        if not session:
+            print("Session not found")
+            return
+
+        # Insert Test History Data into the DB
+        # record_test_history(session)
+
+        # Clean-up Channel objects and data
+        cleanup_call(session)
         return
     
     # If this event is from the Voicebot Channel then extract the Caller Channel
@@ -726,7 +746,9 @@ def on_ari(ws, message):
             "bot_rtp_start_time":0,
             "bot_avg_latency":0,
             "keywords_matched":[],
-            "ivr_step_number":0
+            "ivr_step_number":0,
+            "captured_variables": {}
+
         }
 
         open(transcript_file, "a").write(f"CALL START {timestamp}\n")
@@ -749,27 +771,50 @@ def on_ari(ws, message):
 
         add_channel_to_bridge(session["bridge_id"], channel_id)
 
+
+
+################################################
+# RECORD TEST HISTORY INTO THE DATABASE
+################################################
+
+def record_test_history(session):
+
+    # bridge_id = session.get("bridge_id")
+    # caller = session.get("caller_channel")
+    # voicebot = session.get("voicebot_channel")
+    # external_media = session.get("external_media")
+    # stt_ws = session.get("stt_ws")
+
+    # Initiate DB Connection
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="dbuser",
+        password="dbpassword",
+        database="mydatabase"
+    )
+
+    cursor = conn.cursor()
+
+    sql = """
+    INSERT INTO test_execution
+    (
+        execution_id,
+        phone_number,
+        status
+    )
+    VALUES
+    (
+        %s,
+        %s,
+        %s
+    )
+    """
+
 ################################################
 # HANGUP EVENT HANDLER
 ################################################
 
-def cleanup_call(channel_id):
-
-    print("Cleaning up call for channel:", channel_id)
-
-    session = call_sessions.get(channel_id)
-
-    if not session:
-        # maybe the voicebot channel triggered it
-        for cid, s in call_sessions.items():
-            if s.get("voicebot_channel") == channel_id:
-                session = s
-                channel_id = cid
-                break
-
-    if not session:
-        print("Session not found")
-        return
+def cleanup_call(session):
 
     bridge_id = session.get("bridge_id")
     caller = session.get("caller_channel")
@@ -777,8 +822,27 @@ def cleanup_call(channel_id):
     external_media = session.get("external_media")
     stt_ws = session.get("stt_ws")
 
+    print(bridge_id, caller, voicebot, external_media, stt_ws, sep=" | ")
+
+    print("Cleaning up call for Session: ",session)
+
+    # session = call_sessions.get(channel_id)
+
+    # if not session:
+    #     # maybe the voicebot channel triggered it
+    #     for cid, s in call_sessions.items():
+    #         if s.get("voicebot_channel") == channel_id:
+    #             session = s
+    #             channel_id = cid
+    #             break
+
+    # if not session:
+    #     print("Session not found")
+    #     return
+
     try:
         if caller:
+            print("Deleting Caller Channel:",caller)
             requests.delete(
                 f"{ASTERISK_URL}/ari/channels/{caller}",
                 auth=(ARI_USER, ARI_PASS)
@@ -788,6 +852,7 @@ def cleanup_call(channel_id):
 
     try:
         if voicebot:
+            print("Deleting Voicebot Channel:",voicebot)
             requests.delete(
                 f"{ASTERISK_URL}/ari/channels/{voicebot}",
                 auth=(ARI_USER, ARI_PASS)
@@ -797,6 +862,7 @@ def cleanup_call(channel_id):
 
     try:
         if bridge_id:
+            print("Deleting Bridge:",bridge_id)
             requests.delete(
                 f"{ASTERISK_URL}/ari/bridges/{bridge_id}",
                 auth=(ARI_USER, ARI_PASS)
@@ -806,6 +872,7 @@ def cleanup_call(channel_id):
 
     try:
         if external_media:
+            print("Deleting External Media Channel:",external_media)
             requests.delete(
                 f"{ASTERISK_URL}/ari/channels/{external_media}",
                 auth=(ARI_USER, ARI_PASS)
@@ -815,18 +882,22 @@ def cleanup_call(channel_id):
 
     try:
         if session.get("rtp_addr") in rtp_sessions:
+            print("Deleting RTP Session Map:",rtp_sessions[session["rtp_addr"]])
             del rtp_sessions[session["rtp_addr"]]
     except:
         pass
 
     try:
         if stt_ws:
+            print("Deleting STT WS:", stt_ws)
             stt_ws.close()
     except:
         pass
 
-    if channel_id in call_sessions:
-        del call_sessions[channel_id]
+    # if channel_id in call_sessions:
+    #     del call_sessions[channel_id]
+
+    del session
 
     print("Call cleanup completed")
 
@@ -845,7 +916,7 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
     print("Actual Prompt:",actual_prompt)
     print("Matched: ",result.matched)
     print("Match %:",result.match_percentage)
-    #print("FULL RESULT:\n",result)
+    print("FULL RESULT:\n",result)
     print("=====================================================")
 
     return result
@@ -860,11 +931,18 @@ def main():
     print("Starting Voicebot")
 
     # TEMPORARY TAG MATCH CHECK [ REMOVE FOR PRODUCTION ]
-    expect_to_hear="Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
-    actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
-    # actual_prompt="Yo you Buddy fdsfdsf jkfjdsklfjldskf"
+    # expect_to_hear="Hi {*} Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
+    # actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
+    expect_to_hear="Hi {choice x=kalpan:name|naik:surname} speaking Good {choice y=morning:AM|evening:PM}"
+    actual_prompt="Hi naik speaking Good evening"
 
-    # result = validate_prompts(expect_to_hear, actual_prompt)
+    result = validate_prompts(expect_to_hear, actual_prompt)
+
+    print("Captured Variables:")
+    for var_name, var_value in result.captured_variables.items():
+        print(f"{var_name} = {var_value}")
+
+    # print("Captured variable is x=",result.captured_variables["x"])
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
