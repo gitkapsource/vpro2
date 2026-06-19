@@ -12,9 +12,11 @@ import audioop
 from groq import Groq
 from rapidfuzz import fuzz
 from prompt_validator import validate
+from vpro_json_parser import IVRTestCase
 import mysql.connector
 import re
 from difflib import SequenceMatcher
+
 
 SILENCE_THRESHOLD = 300
 
@@ -336,13 +338,13 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         elif session["dialed_extension"] == "4000":
             if session["ivr_step_number"] == 1:
                 reply_path = synthesize_speech_polly("I would go for 1", base_filename)
-                play_audio(channel_id, base_filename)
+                play_audio(channel_id, reply_path)
             elif session["ivr_step_number"] == 2:
                 reply_path = synthesize_speech_polly("I would go for 2", base_filename)
-                play_audio(channel_id, base_filename)
+                play_audio(channel_id, reply_path)
             else:
                 reply_path = synthesize_speech_polly("I would go for 3", base_filename)
-                play_audio(channel_id, base_filename)
+                play_audio(channel_id, reply_path)
 
         elif session["dialed_extension"] == "5000":
             if session["ivr_step_number"] == 1:
@@ -441,16 +443,19 @@ def match_choice_prompt(expected_prompt, actual_prompt):
 # POLLY TTS
 ################################################
 
-def synthesize_speech_polly(text, base_filename):
+def synthesize_speech_polly(text, base_filename, language_code="en-US", voice_id="Joey"):
 
     polly = boto3.client("polly", region_name="ap-south-1")
 
     response = polly.synthesize_speech(
         Text=text,
         OutputFormat="pcm",
-        VoiceId="Joanna",
+        LanguageCode=language_code,
+        VoiceId=voice_id,
         SampleRate="8000"
     )
+
+    print("TTS Response:",response)
 
     raw_file = f"{base_filename}.pcm"
     ulaw_file = f"{base_filename}.ulaw"
@@ -920,7 +925,18 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
     print("=====================================================")
 
     return result
-    
+  
+################################################
+# IVR TEST JSON PARSER
+################################################
+  
+def load_test_case(json_file):
+
+    with open(json_file, "r") as f:
+
+        data = json.load(f)
+
+    return IVRTestCase(data)
 
 ################################################
 # MAIN
@@ -943,6 +959,79 @@ def main():
         print(f"{var_name} = {var_value}")
 
     # print("Captured variable is x=",result.captured_variables["x"])
+
+    # Load and Parse ivr_test.json Test Case File
+    json_file = "ivr_test.json"
+    test_case = load_test_case(json_file)
+
+    print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
+    print("_" * 100)
+        # print("Language IDs:", test_case.test_model_settings.language_ids)
+        # print("Persona:", test_case.test_model_settings.persona)
+        # print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
+        # print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
+        # print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
+        # print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
+
+        # if test_case.test_model_settings.extended_attributes:
+        #     print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
+
+        # node = test_case.get_node("node_102")
+
+        # print(node.node_type)
+        # print(node.expected_text)
+
+        # if node.action_to_take:
+        #     print(node.action_to_take.inject_type)
+        #     print(node.action_to_take.value)
+
+        # print(node.transitions)
+
+
+    current_node = test_case.get_start_node()
+
+    while current_node:
+
+        print("_" * 100)
+
+        print(f"NODE ID: {current_node.node_id}: ")
+        print(f"EXPECTED TEXT: {current_node.expected_text}")
+
+        if current_node.action_to_take:
+            print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+            print("ACTION DATA: ", current_node.action_to_take.value)
+
+        print("Language IDs:", current_node.language_ids)
+        print("Persona:", current_node.persona)
+
+        try:
+            if current_node.persona:
+                for language_code in current_node.persona:
+                    if current_node.persona[language_code]["VI"]:
+                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+        except:
+            pass
+
+        print("Minor Threshold Time:", current_node.minor_threshold_time)
+        print("Major Threshold Time:", current_node.major_threshold_time)
+        print("Minor Confidence Level:", current_node.minor_confidence_level)
+        print("Major Confidence Level:", current_node.major_confidence_level)
+
+        if current_node.extended_attributes:
+            print("Extended Attributes:", current_node.extended_attributes)
+
+        print("TRANSITIONS: ",current_node.transitions)
+   
+        next_node_id = current_node.transitions.get(
+            "on_success"
+        )
+
+        if not next_node_id:
+            break
+
+        current_node = test_case.get_node(
+            next_node_id
+        )
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
