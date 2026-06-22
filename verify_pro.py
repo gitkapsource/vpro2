@@ -9,6 +9,7 @@ import boto3
 import subprocess
 import datetime
 import audioop
+from dataclasses import asdict
 from groq import Groq
 from rapidfuzz import fuzz
 from prompt_validator import validate
@@ -70,6 +71,8 @@ def is_speech_packet(payload):
 
     energy = audioop.rms(pcm, 2)
 
+    #print("Energy : ", energy)
+
     if energy > SILENCE_THRESHOLD:
         return True
     else:
@@ -114,19 +117,20 @@ def rtp_receiver():
             #print("Speech packet")
 
             if session["bot_rtp_start_time"] > 0:
-                print("Bot RTP Start Time was:", session["bot_rtp_start_time"],"Current Time is:",time.monotonic())
+                print("\n",session["voicebot_channel"],":Bot RTP Start Time was:", session["bot_rtp_start_time"],"Current Time is:",time.monotonic())
                 session["bot_last_rtp_time"] = time.monotonic()
                 current_latency = time.monotonic() - session["bot_rtp_start_time"]
 
-                if session["bot_avg_latency"] > 0:
-                    session["bot_avg_latency"] = (session["bot_avg_latency"] + current_latency)/2
-                else:
-                    session["bot_avg_latency"] = current_latency
+                # if session["bot_avg_latency"] > 0:
+                #     session["bot_avg_latency"] = (session["bot_avg_latency"] + current_latency)/2
+                # else:
+                  
+                session["bot_avg_latency"] = current_latency
 
-                print("Current Latency: ", current_latency ,"Bot Average Latency Recorded:", session["bot_avg_latency"])
+                print("\n",session,":Current Latency: ", current_latency ,"Bot Average Latency Recorded:", session["bot_avg_latency"])
                 session["bot_rtp_start_time"] = 0
-        #else:
-            #print("Silence packet")
+        # else:
+        #     print("Silence packet")
 
         ws = session.get("stt_ws")
 
@@ -135,32 +139,6 @@ def rtp_receiver():
                 ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
             except:
                 pass
-
-""" def rtp_receiver():
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", RTP_PORT))
-
-    print("RTP listening on", RTP_PORT)
-
-    while True:
-
-        packet, addr = sock.recvfrom(2048)
-        payload = packet[12:]
-
-        src_ip, src_port = addr
-        session = rtp_sessions.get((src_ip, src_port))
-
-        if not session:
-            return
-        
-        ws = session.get("stt_ws")
-
-        if ws:
-            try:
-                ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
-            except:
-                pass """
 
 
 ################################################
@@ -202,7 +180,7 @@ def on_stt(ws, message, channel_id):
 
     if transcript.strip():
 
-        print("Transcript:", transcript)
+        print("on_stt: Transcript:", transcript)
 
         session["transcript"] += " " + transcript
 
@@ -226,7 +204,7 @@ def on_stt(ws, message, channel_id):
 
     elif session["transcript"]:
 
-        print("Current Transcript:", session["transcript"])
+        print("on_stt: Current Transcript:", session["transcript"])
 
         process_transcript = session["transcript"]
         session["transcript"] = ""
@@ -242,7 +220,7 @@ def on_stt(ws, message, channel_id):
         ).start()
 
     else:
-        print("Skipping Action")
+        print("on_stt: Skipping Action")
 
 ################################################
 # WRITE TRANSCRIPT TO A FILE
@@ -277,8 +255,6 @@ def write_transcript(channel_id, speaker, text):
 
 def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_id):
 
-    #llm_response = generate_llm_reply(transcript_text)
-
     expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
     #nodedata_match = match_nodedata(expected_prompt, transcript_text)
 
@@ -286,17 +262,9 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     #print("Tag Match Result: ", result)      
 
-    #write_transcript(parent_channel_id, "KCAI", llm_response)
-    #print("Let's generate TTS\n")
-    #reply_path = synthesize_speech_polly(llm_response, base_filename)
-    #play_audio(channel_id, base_filename)
-    #play_audio_bridge(parent_channel_id, base_filename)
-    # OR
-
     session = call_sessions[parent_channel_id]
 
     if session:
-
         print("Session Captured Variables:",session["captured_variables"])
 
         if (result.captured_variables and any(result.captured_variables.values())):
@@ -304,7 +272,54 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
         print("Session Object: ",session)
         session["ivr_step_number"] += 1
+
+        # Set Test Data Node Data and Result
+
+        if session["current_node_id"] is None:
+            current_node = session["test_case"].get_start_node()
+        elif session["current_node_id"] == "EOF":
+            print("End Of Test Case Detected, Ending the TestCall")
+            hangup_channel(channel_id)
+            return
+        else:
+            current_node = session["test_case"].get_node(session["current_node_id"])
+
+        session["current_node_id"] = current_node.node_id
+        session["expected_text"] = current_node.expected_text
+
+        # if current_node.action_to_take:
+        #     print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+        #     print("ACTION DATA: ", current_node.action_to_take.value)
+
+        # print("Language IDs:", current_node.language_ids)
+        # print("Persona:", current_node.persona)
+
+        # try:
+        #     if current_node.persona:
+        #         for language_code in current_node.persona:
+        #             if current_node.persona[language_code]["VI"]:
+        #                 print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+        # except:
+        #     pass
+
+        # print("Minor Threshold Time:", current_node.minor_threshold_time)
+        # print("Major Threshold Time:", current_node.major_threshold_time)
+        # print("Minor Confidence Level:", current_node.minor_confidence_level)
+        # print("Major Confidence Level:", current_node.major_confidence_level)
+
+        session["node_result"] = {
+            "node_id": session["ivr_step_number"], #session["current_node_id"],
+            "expected_text": session["expected_text"],
+            "actual_text": transcript_text,
+            "transcription_match": result.match_percentage,
+            "response_time": session["bot_avg_latency"],
+            "test_result": json.dumps(asdict(result),ensure_ascii=False),
+            "timestamp":
+                "2026-06-22T18:21:55Z"
+        }
     
+        # Temporary Response generation based on Dialed Extension
+
         if session["dialed_extension"] == "1000":
 
             if session["ivr_step_number"] == 1:
@@ -338,13 +353,13 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         elif session["dialed_extension"] == "4000":
             if session["ivr_step_number"] == 1:
                 reply_path = synthesize_speech_polly("I would go for 1", base_filename)
-                play_audio(channel_id, reply_path)
+                play_audio(channel_id, base_filename)
             elif session["ivr_step_number"] == 2:
                 reply_path = synthesize_speech_polly("I would go for 2", base_filename)
-                play_audio(channel_id, reply_path)
+                play_audio(channel_id, base_filename)
             else:
                 reply_path = synthesize_speech_polly("I would go for 3", base_filename)
-                play_audio(channel_id, reply_path)
+                play_audio(channel_id, base_filename)
 
         elif session["dialed_extension"] == "5000":
             if session["ivr_step_number"] == 1:
@@ -355,6 +370,22 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                 play_silence(channel_id, 4)
 
             print("IVR Step Number:", session["ivr_step_number"])
+
+            print("TRANSITIONS: ",current_node.transitions)
+
+        # Insert Test History Data into the DB
+        record_test_history(session)
+
+        # Evaluate the Next Node ID
+        next_node_id = current_node.transitions.get("on_success")
+
+        if next_node_id:
+            print("Next Node ID: ", next_node_id)
+            current_node = session["test_case"].get_node(next_node_id)
+            if current_node:
+                session["current_node_id"] = current_node.node_id
+            else:
+                session["current_node_id"] = "EOF"
 
     else:
         print("Session Not Found for IVR Traversal") 
@@ -387,56 +418,56 @@ def similarity(a, b):
     )
 
 
-def match_choice_prompt(expected_prompt, actual_prompt):
+# def match_choice_prompt(expected_prompt, actual_prompt):
 
-    pattern = r"\{choice\s+(.+?)\}"
+#     pattern = r"\{choice\s+(.+?)\}"
 
-    match = re.search(pattern, expected_prompt, re.IGNORECASE)
+#     match = re.search(pattern, expected_prompt, re.IGNORECASE)
 
-    if not match:
-        return False
+#     if not match:
+#         return False
 
-    choice_content = match.group(1)
+#     choice_content = match.group(1)
 
-    variable_name, choices = parse_choice_tag(choice_content)
+#     variable_name, choices = parse_choice_tag(choice_content)
 
-    best_percentage = 0
-    best_match = None
+#     best_percentage = 0
+#     best_match = None
 
-    before_text = expected_prompt[:match.start()].strip().lower()
-    after_text = expected_prompt[match.end():].strip().lower()
+#     before_text = expected_prompt[:match.start()].strip().lower()
+#     after_text = expected_prompt[match.end():].strip().lower()
 
-    for prompt, value in choices:
+#     for prompt, value in choices:
 
-        candidate = (
-            before_text + " " +
-            prompt.lower() + " " +
-            after_text
-        ).strip()
+#         candidate = (
+#             before_text + " " +
+#             prompt.lower() + " " +
+#             after_text
+#         ).strip()
 
-        percent = similarity(candidate, actual_prompt)
+#         percent = similarity(candidate, actual_prompt)
 
-        print("\nCandidate :", candidate)
-        print("Match %   :", percent)
+#         print("\nCandidate :", candidate)
+#         print("Match %   :", percent)
 
-        if percent > best_percentage:
-            best_percentage = percent
-            best_match = prompt
+#         if percent > best_percentage:
+#             best_percentage = percent
+#             best_match = prompt
 
-        # Exact match
-        if candidate == actual_prompt.lower().strip():
+#         # Exact match
+#         if candidate == actual_prompt.lower().strip():
 
-            print("\nEXACT MATCH :", prompt)
+#             print("\nEXACT MATCH :", prompt)
 
-            if variable_name and value:
-                variables[variable_name] = value
+#             if variable_name and value:
+#                 variables[variable_name] = value
 
-            return True
+#             return True
 
-    print("\nBest Match :", best_match)
-    print("Best Match % :", best_percentage)
+#     print("\nBest Match :", best_match)
+#     print("Best Match % :", best_percentage)
 
-    return False
+#     return False
 
 
 ################################################
@@ -522,7 +553,19 @@ def play_audio_bridge(channel_id, sound):
         json={"media": f"sound:{sound}"}
     )
 
+def hangup_channel(channel_id):
 
+    r = requests.delete(
+        f"{ASTERISK_URL}/ari/channels/{channel_id}",
+        auth=(ARI_USER, ARI_PASS)
+    )
+
+    print(
+        f"Hangup channel {channel_id}: "
+        f"{r.status_code}"
+    )
+
+    return r.status_code == 204
 ################################################
 # PLAY DTMF TO THE VOICEBOT CHANNEL
 ################################################
@@ -617,15 +660,15 @@ def add_channel_to_bridge(bridge, channel):
     )
 
 
-def dial_voicebot(channel_id):
+def dial_voicebot(channel_id, test_case):
 
-    print("Originating Voicebot Channel")
+    print("Originating Voicebot Channel on the Phone Number:", test_case.meta.phone_to_dial)
 
     requests.post(
         f"{ASTERISK_URL}/ari/channels",
         auth=(ARI_USER, ARI_PASS),
         params={
-            "endpoint": "Local/1234@ivr-test-final",
+            "endpoint": f"Local/{test_case.meta.phone_to_dial}@ivr-test-final",
             "app": APP_NAME,
             "appArgs": channel_id
         }
@@ -639,38 +682,57 @@ def dial_voicebot(channel_id):
 def on_ari(ws, message):
 
     event = json.loads(message)
-    # print("Incoming Event Type:", event)
+    #print("on_ari: Incoming Event:", event)
+    #print("on_ari: MR KAPS Event TYPE:", event["type"])
 
-    if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
-        #print("This is ;2 leg, ignore")
-        return
+    # if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
+    #     print("This is ;2 leg, ignore")
+    #     return
     
     parent_channel = None
 
-    #print("Incoming Event Type:", event)
-    # print("Incoming Event Type:", event["type"])
-
     if event["type"] == "PlaybackFinished":
+        # print("KAPS KAPS KAPS Event Type:", event["type"], " for Channel ID: ", event["playback"]["target_uri"].split(":")[1])
         target_uri = event["playback"]["target_uri"]
         channel_id = target_uri.split(":")[1]
 
-        print("Playback Finished:", channel_id)
-
         for cid, s in call_sessions.items():
-            if s.get("voicebot_channel") == channel_id:
-                print("Found Parent Channel for Playback Finished Logic:", channel_id)
-                session = s
-                session["bot_rtp_start_time"] = time.monotonic()
-                break
+                if s.get("voicebot_channel") == channel_id:
+                    print("Found Parent Channel for Playback Finished Logic:", channel_id," at:",time.monotonic())
+                    session = s
+                    session["bot_rtp_start_time"] = time.monotonic()
+                    break
 
         return
 
-    channel_id = event["channel"]["id"]
-    channel_name = event["channel"]["name"]
+    elif event["type"] == "ChannelDtmfReceived":
+        channel_id = event["channel"]["id"]
+        channel_name = event["channel"]["name"].split(";")[0]
+
+        print("KAPS KAPS KAPS Event Type:", event["type"], " for Channel ID: ", channel_id, " channel_name" ,channel_name)
+
+
+        for cid, s in call_sessions.items():
+                if s.get("voicebot_channel_name") == channel_name:
+                    print("Found Parent Channel for DTMF Finished Logic:", channel_id," at:",time.monotonic())
+                    session = s
+                    session["bot_rtp_start_time"] = time.monotonic()
+                    break
+        
+        return
+
+    try:
+        # if channel_id is None:
+            channel_id = event["channel"]["id"]
+            channel_name = event["channel"]["name"]
+    except:
+        print("on_ari: Exception: Some Error for the Event:", event)
 
     if event["type"] == "StasisEnd":
 
-        #channel_id = event["channel"]["id"]
+        if channel_id is None:
+            channel_id = event["channel"]["id"]
+
         print("Channel left Stasis:", channel_id)
 
         # Let's find the session for the channel_id
@@ -687,9 +749,6 @@ def on_ari(ws, message):
         if not session:
             print("Session not found")
             return
-
-        # Insert Test History Data into the DB
-        # record_test_history(session)
 
         # Clean-up Channel objects and data
         cleanup_call(session)
@@ -723,6 +782,12 @@ def on_ari(ws, message):
 
     if parent_channel is None:
 
+        #Let's populate the test cases for this call
+        test_case = load_test_case()
+        if test_case is None:
+            print("Test Case could not be parsed")
+            return
+
         play_audio(channel_id, "beep")
     
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -738,22 +803,52 @@ def on_ari(ws, message):
         ext_media = create_external_media()
         
         call_sessions[channel_id] = {
+            # Call-specific
+            "call_id": None,
             "dialed_extension": exten,
             "caller_channel": channel_id,
             "bridge_id": bridge_id,
             "voicebot_channel": None,
+            "voicebot_channel_name": None,
             "external_media" : ext_media,
             "transcript": "",
             "transcript_file": transcript_file,
             "stt_ws": stt_ws,
             "rtp_addr": None,
+
+            # Voicebot Channel RTP specific
+            "bot_dial_time":time.monotonic(),
+            "bot_connect_time":0,
+            "bot_answer_duration":0,
             "bot_last_rtp_time":0,
             "bot_rtp_start_time":0,
             "bot_avg_latency":0,
-            "keywords_matched":[],
-            "ivr_step_number":0,
-            "captured_variables": {}
 
+            "keywords_matched":[],
+            
+            # Prompt engine variables
+            "captured_variables": {},
+
+            # Test execution
+            "ivr_step_number":0,
+            "test_execution_row_id": 12458,
+            "phone_to_dial": "+18005550199",
+            "current_node_id": None,
+            "execution_status": "RUNNING",
+
+            # Node results
+            "node_result": [],
+
+            # Overall metrics
+            "summary": {
+                "total_nodes": 0,
+                "passed_nodes": 0,
+                "failed_nodes": 0,
+                "overall_result": None
+            },
+
+            # Test Case Data
+            "test_case": test_case
         }
 
         open(transcript_file, "a").write(f"CALL START {timestamp}\n")
@@ -761,21 +856,106 @@ def on_ari(ws, message):
         add_channel_to_bridge(bridge_id, channel_id)
         add_channel_to_bridge(bridge_id, ext_media)
 
-        dial_voicebot(channel_id)
+        dial_voicebot(channel_id, test_case)
 
     else:
         print("Caller Channel is Available: Voicebot Channel")
 
         session = call_sessions[parent_channel]
 
+        session["bot_connect_time"] = time.monotonic()
+        session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
+
         print("Adding voicebot to bridge")
 
         session["voicebot_channel"] = channel_id
+        session["voicebot_channel_name"] = channel_name.split(";")[0]
 
         #record_channel(channel_id)
 
         add_channel_to_bridge(session["bridge_id"], channel_id)
 
+################################################
+# LOAD THE TEST CASE FROM THE IVR TEST JSON
+################################################
+
+def load_test_case(json_file="ivr_test.json"):
+    # Load and Parse ivr_test.json Test Case File
+    test_case = json_file_parse(json_file)
+
+    if not test_case:
+        return None
+
+    print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
+    print("_" * 100)
+        # print("Language IDs:", test_case.test_model_settings.language_ids)
+        # print("Persona:", test_case.test_model_settings.persona)
+        # print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
+        # print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
+        # print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
+        # print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
+
+        # if test_case.test_model_settings.extended_attributes:
+        #     print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
+
+        # node = test_case.get_node("node_102")
+
+        # print(node.node_type)
+        # print(node.expected_text)
+
+        # if node.action_to_take:
+        #     print(node.action_to_take.inject_type)
+        #     print(node.action_to_take.value)
+
+        # print(node.transitions)
+
+
+    current_node = test_case.get_start_node()
+
+    while current_node:
+
+        print("_" * 100)
+
+        print(f"NODE ID: {current_node.node_id}: ")
+        print(f"EXPECTED TEXT: {current_node.expected_text}")
+
+        if current_node.action_to_take:
+            print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+            print("ACTION DATA: ", current_node.action_to_take.value)
+
+        print("Language IDs:", current_node.language_ids)
+        print("Persona:", current_node.persona)
+
+        try:
+            if current_node.persona:
+                for language_code in current_node.persona:
+                    if current_node.persona[language_code]["VI"]:
+                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+        except:
+            pass
+
+        print("Minor Threshold Time:", current_node.minor_threshold_time)
+        print("Major Threshold Time:", current_node.major_threshold_time)
+        print("Minor Confidence Level:", current_node.minor_confidence_level)
+        print("Major Confidence Level:", current_node.major_confidence_level)
+
+        if current_node.extended_attributes:
+            print("Extended Attributes:", current_node.extended_attributes)
+
+        print("TRANSITIONS: ",current_node.transitions)
+   
+        next_node_id = current_node.transitions.get(
+            "on_success"
+        )
+
+        if not next_node_id:
+            break
+
+        current_node = test_case.get_node(
+            next_node_id
+        )
+
+    return test_case
 
 
 ################################################
@@ -790,30 +970,78 @@ def record_test_history(session):
     # external_media = session.get("external_media")
     # stt_ws = session.get("stt_ws")
 
+    sql = f""" 
+            INSERT INTO kcdb.verify_pro_test_execution_row_node_history
+            (
+            verify_pro_test_execution_row_history_id, 
+            verify_pro_node_id, 
+            mos, 
+            time_to_silence, 
+            actual_text, 
+            transcription_match, 
+            response_time, 
+            test_result, 
+            created_on)
+            VALUES
+            (
+            %s,%s,%s,%s,%s,%s,%s,%s,current_timestamp()
+            )
+            """
+
+        #     VALUES(
+        #     '{session["test_execution_row_id"]}', 
+        #     '{session["node_result"]["node_id"]}', 
+        #     '0.00', 
+        #     '0.00', 
+        #     '{session["node_result"]["actual_text"]}', 
+        #     '{session["node_result"]["transcription_match"]}',
+        #     '{session["node_result"]["response_time"]}', 
+        #     {session["node_result"]["test_result"]}, 
+        #     current_timestamp())
+        # """
+
     # Initiate DB Connection
     conn = mysql.connector.connect(
-        host="localhost",
-        user="dbuser",
-        password="dbpassword",
-        database="mydatabase"
+        host="demo-db.cw5iuewmdvyf.ap-south-1.rds.amazonaws.com",
+        user="w3buser",
+        password="D8p4uW38U$3r",
+        database="kcdb",
+        port=33306
     )
 
     cursor = conn.cursor()
 
-    sql = """
-    INSERT INTO test_execution
-    (
-        execution_id,
-        phone_number,
-        status
-    )
-    VALUES
-    (
-        %s,
-        %s,
-        %s
-    )
-    """
+    try:
+        
+        print(f"Insert SQL : {sql}")
+
+        # 4. Execute the query
+        cursor.execute(sql,
+            (
+            session["test_execution_row_id"], 
+            session["node_result"]["node_id"], 
+            0.00, 
+            0.00, 
+            session["node_result"]["actual_text"], 
+            session["node_result"]["transcription_match"],
+            session["node_result"]["response_time"],
+            session["node_result"]["test_result"]
+            ))
+    
+        # 5. COMMIT THE TRANSACTION (Crucial for INSERT, UPDATE, DELETE)
+        conn.commit()
+    
+        # 6. Get the auto-incremented ID (Optional)
+        print(f"Successfully inserted. New Row ID: {cursor.lastrowid}")
+
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        conn.rollback() # Undo changes if an error happens
+
+    finally:
+        # 7. Close connections
+        cursor.close()
+        conn.close()
 
 ################################################
 # HANGUP EVENT HANDLER
@@ -906,6 +1134,7 @@ def cleanup_call(session):
 
     print("Call cleanup completed")
 
+
 ################################################
 # TEMPORARY TAG MATCH LOGIC [ REMOVE THIS FOR PRODUCTION ]
 ################################################
@@ -930,7 +1159,7 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
 # IVR TEST JSON PARSER
 ################################################
   
-def load_test_case(json_file):
+def json_file_parse(json_file):
 
     with open(json_file, "r") as f:
 
@@ -959,79 +1188,6 @@ def main():
         print(f"{var_name} = {var_value}")
 
     # print("Captured variable is x=",result.captured_variables["x"])
-
-    # Load and Parse ivr_test.json Test Case File
-    json_file = "ivr_test.json"
-    test_case = load_test_case(json_file)
-
-    print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
-    print("_" * 100)
-        # print("Language IDs:", test_case.test_model_settings.language_ids)
-        # print("Persona:", test_case.test_model_settings.persona)
-        # print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
-        # print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
-        # print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
-        # print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
-
-        # if test_case.test_model_settings.extended_attributes:
-        #     print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
-
-        # node = test_case.get_node("node_102")
-
-        # print(node.node_type)
-        # print(node.expected_text)
-
-        # if node.action_to_take:
-        #     print(node.action_to_take.inject_type)
-        #     print(node.action_to_take.value)
-
-        # print(node.transitions)
-
-
-    current_node = test_case.get_start_node()
-
-    while current_node:
-
-        print("_" * 100)
-
-        print(f"NODE ID: {current_node.node_id}: ")
-        print(f"EXPECTED TEXT: {current_node.expected_text}")
-
-        if current_node.action_to_take:
-            print("INJECT TYPE: ", current_node.action_to_take.inject_type)
-            print("ACTION DATA: ", current_node.action_to_take.value)
-
-        print("Language IDs:", current_node.language_ids)
-        print("Persona:", current_node.persona)
-
-        try:
-            if current_node.persona:
-                for language_code in current_node.persona:
-                    if current_node.persona[language_code]["VI"]:
-                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
-        except:
-            pass
-
-        print("Minor Threshold Time:", current_node.minor_threshold_time)
-        print("Major Threshold Time:", current_node.major_threshold_time)
-        print("Minor Confidence Level:", current_node.minor_confidence_level)
-        print("Major Confidence Level:", current_node.major_confidence_level)
-
-        if current_node.extended_attributes:
-            print("Extended Attributes:", current_node.extended_attributes)
-
-        print("TRANSITIONS: ",current_node.transitions)
-   
-        next_node_id = current_node.transitions.get(
-            "on_success"
-        )
-
-        if not next_node_id:
-            break
-
-        current_node = test_case.get_node(
-            next_node_id
-        )
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
