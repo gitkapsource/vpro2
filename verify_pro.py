@@ -7,11 +7,15 @@ import os
 import time
 import boto3
 import subprocess
-import datetime
 import audioop
+import random
+import datetime
+#from datetime import datetime, timezone
 from dataclasses import asdict
+
 from groq import Groq
 from rapidfuzz import fuzz
+
 from prompt_validator import validate
 from vpro_json_parser import IVRTestCase
 from db_connection import get_db_conn
@@ -265,6 +269,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     session = call_sessions[parent_channel_id]
 
+
     if session:
         print("Session Captured Variables:",session["captured_variables"])
 
@@ -288,26 +293,9 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         session["current_node_id"] = current_node.node_id
         session["expected_text"] = current_node.expected_text
 
-        # if current_node.action_to_take:
-        #     print("INJECT TYPE: ", current_node.action_to_take.inject_type)
-        #     print("ACTION DATA: ", current_node.action_to_take.value)
-
-        # print("Language IDs:", current_node.language_ids)
-        # print("Persona:", current_node.persona)
-
-        # try:
-        #     if current_node.persona:
-        #         for language_code in current_node.persona:
-        #             if current_node.persona[language_code]["VI"]:
-        #                 print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
-        # except:
-        #     pass
-
-        # print("Minor Threshold Time:", current_node.minor_threshold_time)
-        # print("Major Threshold Time:", current_node.major_threshold_time)
-        # print("Minor Confidence Level:", current_node.minor_confidence_level)
-        # print("Major Confidence Level:", current_node.major_confidence_level)
-
+        # For debugging print the node test details
+        print_node_test_details(current_node)
+        
         session["node_result"] = {
             "node_id": session["ivr_step_number"], #session["current_node_id"],
             "expected_text": session["expected_text"],
@@ -315,60 +303,89 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             "transcription_match": result.match_percentage,
             "response_time": session["bot_avg_latency"],
             "test_result": json.dumps(asdict(result),ensure_ascii=False),
-            "timestamp":
-                "2026-06-22T18:21:55Z"
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ") #"2026-06-22T18:21:55Z" 
         }
     
+        try:
+            if current_node.persona:
+                for language_code in current_node.persona:
+                    if current_node.persona[language_code]["VI"]:
+                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+
+            if current_node.action_to_take:
+                print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+                print("ACTION DATA: ", current_node.action_to_take.value)
+            else:
+                print("No Action to take: Let's Skip this Node")
+                # Insert Test History Data into the DB
+                record_test_history(session)
+
+                # Evaluate the Next Node ID
+                next_node_id = current_node.transitions.get("on_success")
+
+                if next_node_id:
+                    print("Next Node ID: ", next_node_id)
+                    current_node = session["test_case"].get_node(next_node_id)
+                    if current_node:
+                        session["current_node_id"] = current_node.node_id
+                    else:
+                        session["current_node_id"] = "EOF"
+
+                return
+
+        except:
+            pass
+
         # Temporary Response generation based on Dialed Extension
 
-        if session["dialed_extension"] == "1000":
+        if session["dialed_extension"] == "1000" or current_node.action_to_take.inject_type == "DTMF":
 
             if session["ivr_step_number"] == 1:
-                send_dtmf(channel_id, "1")
+                send_dtmf(channel_id, current_node.action_to_take.value)
             elif session["ivr_step_number"] == 2:
-                send_dtmf(channel_id, "1")
+                send_dtmf(channel_id, current_node.action_to_take.value)
             else:
-                send_dtmf(channel_id, "1")
-                print("Final Traversal: 1 | 1 | 1")
+                send_dtmf(channel_id, current_node.action_to_take.value)
+                print("Final Traversal: ")
 
             print("IVR Step Number:", session["ivr_step_number"])
         
-        elif session["dialed_extension"] == "2000":
+        elif session["dialed_extension"] == "2000" or current_node.action_to_take.inject_type == "DTMF":
 
             if session["ivr_step_number"] == 1:
-                send_dtmf(channel_id, "2")
+                send_dtmf(channel_id, current_node.action_to_take.value)
             elif session["ivr_step_number"] == 2:
-                send_dtmf(channel_id, "3")
+                send_dtmf(channel_id, current_node.action_to_take.value)
             else:
                 send_dtmf(channel_id, "1")
-                print("Final Traversal: 2 | 3 | 1")
+                print("Final Traversal: ")
 
-        elif session["dialed_extension"] == "3000":
+        elif session["dialed_extension"] == "3000" or current_node.action_to_take.inject_type == "Speech":
             if session["ivr_step_number"] == 1:
-                play_audio(channel_id, "beep")
+                play_audio(channel_id, current_node.action_to_take.value)
             elif session["ivr_step_number"] == 2:
-                play_audio(channel_id, "beep")
+                play_audio(channel_id, current_node.action_to_take.value)
             else:
-                play_audio(channel_id, "beep")
+                play_audio(channel_id, current_node.action_to_take.value)
 
-        elif session["dialed_extension"] == "4000":
+        elif session["dialed_extension"] == "4000"  or current_node.action_to_take.inject_type == "TTS":
             if session["ivr_step_number"] == 1:
-                reply_path = synthesize_speech_polly("I would go for 1", base_filename)
+                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
                 play_audio(channel_id, base_filename)
             elif session["ivr_step_number"] == 2:
-                reply_path = synthesize_speech_polly("I would go for 2", base_filename)
+                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
                 play_audio(channel_id, base_filename)
             else:
-                reply_path = synthesize_speech_polly("I would go for 3", base_filename)
+                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
                 play_audio(channel_id, base_filename)
 
-        elif session["dialed_extension"] == "5000":
+        elif session["dialed_extension"] == "5000" or current_node.action_to_take.inject_type == "Silence":
             if session["ivr_step_number"] == 1:
-                play_silence(channel_id, 3)
+                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
             elif session["ivr_step_number"] == 2:
-                play_silence(channel_id, 5)
+                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
             else:
-                play_silence(channel_id, 4)
+                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
 
             print("IVR Step Number:", session["ivr_step_number"])
 
@@ -390,6 +407,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     else:
         print("Session Not Found for IVR Traversal") 
+
         
 def match_nodedata(expected_prompt, actual_prompt):
 
@@ -418,58 +436,16 @@ def similarity(a, b):
         2
     )
 
+def print_node_test_details(current_node):
 
-# def match_choice_prompt(expected_prompt, actual_prompt):
+        print("Language IDs:", current_node.language_ids)
+        print("Persona:", current_node.persona)
 
-#     pattern = r"\{choice\s+(.+?)\}"
-
-#     match = re.search(pattern, expected_prompt, re.IGNORECASE)
-
-#     if not match:
-#         return False
-
-#     choice_content = match.group(1)
-
-#     variable_name, choices = parse_choice_tag(choice_content)
-
-#     best_percentage = 0
-#     best_match = None
-
-#     before_text = expected_prompt[:match.start()].strip().lower()
-#     after_text = expected_prompt[match.end():].strip().lower()
-
-#     for prompt, value in choices:
-
-#         candidate = (
-#             before_text + " " +
-#             prompt.lower() + " " +
-#             after_text
-#         ).strip()
-
-#         percent = similarity(candidate, actual_prompt)
-
-#         print("\nCandidate :", candidate)
-#         print("Match %   :", percent)
-
-#         if percent > best_percentage:
-#             best_percentage = percent
-#             best_match = prompt
-
-#         # Exact match
-#         if candidate == actual_prompt.lower().strip():
-
-#             print("\nEXACT MATCH :", prompt)
-
-#             if variable_name and value:
-#                 variables[variable_name] = value
-
-#             return True
-
-#     print("\nBest Match :", best_match)
-#     print("Best Match % :", best_percentage)
-
-#     return False
-
+        print("Minor Threshold Time:", current_node.minor_threshold_time)
+        print("Major Threshold Time:", current_node.major_threshold_time)
+        print("Minor Confidence Level:", current_node.minor_confidence_level)
+        print("Major Confidence Level:", current_node.major_confidence_level)
+    
 
 ################################################
 # POLLY TTS
@@ -536,6 +512,22 @@ def play_silence(channel_id, seconds):
         auth=(ARI_USER, ARI_PASS),
         json={"media": f"sound:silence/{seconds}"}
     )
+
+    print("Silence playback response:", r.status_code, r.text)
+
+    return r
+
+def play_silence_duration(channel_id, seconds):
+
+    print(f"Playing {seconds} seconds of silence")
+
+    # r = requests.post(
+    #     f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
+    #     auth=(ARI_USER, ARI_PASS),
+    #     json={"media": f"sound:silence/{seconds}"}
+    # )
+
+    time.sleep(seconds)
 
     print("Silence playback response:", r.status_code, r.text)
 
@@ -833,7 +825,7 @@ def on_ari(ws, message):
 
             # Test execution
             "ivr_step_number":0,
-            "test_execution_row_id": int(time.monotonic()/1000), #12459, #
+            "test_execution_row_id": int(time.monotonic()/1000), #Temporary Logic for Dynamic Value
             "phone_to_dial": "+18005550199",
             "current_node_id": None,
             "execution_status": "RUNNING",
