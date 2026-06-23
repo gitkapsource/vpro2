@@ -336,60 +336,27 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         except:
             pass
 
-        # Temporary Response generation based on Dialed Extension
+        # Response generation based on Node Data
+        print("IVR Step Number:", session["ivr_step_number"])
 
-        if session["dialed_extension"] == "1000" or current_node.action_to_take.inject_type == "DTMF":
+        if current_node.action_to_take.inject_type == "DTMF":
+            send_dtmf(channel_id, current_node.action_to_take.value)
 
-            if session["ivr_step_number"] == 1:
-                send_dtmf(channel_id, current_node.action_to_take.value)
-            elif session["ivr_step_number"] == 2:
-                send_dtmf(channel_id, current_node.action_to_take.value)
-            else:
-                send_dtmf(channel_id, current_node.action_to_take.value)
-                print("Final Traversal: ")
+        elif current_node.action_to_take.inject_type == "Speech":
+            play_audio(channel_id, current_node.action_to_take.value)
 
-            print("IVR Step Number:", session["ivr_step_number"])
-        
-        elif session["dialed_extension"] == "2000" or current_node.action_to_take.inject_type == "DTMF":
+        elif current_node.action_to_take.inject_type == "TTS":
+            reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
+            play_audio(channel_id, base_filename)
 
-            if session["ivr_step_number"] == 1:
-                send_dtmf(channel_id, current_node.action_to_take.value)
-            elif session["ivr_step_number"] == 2:
-                send_dtmf(channel_id, current_node.action_to_take.value)
-            else:
-                send_dtmf(channel_id, "1")
-                print("Final Traversal: ")
+        elif current_node.action_to_take.inject_type == "Silence":
+            min_val, max_val = map(int,current_node.action_to_take.value.split("-"))
+            random_silence = random.randint(min_val, max_val)
+            play_silence(channel_id, random_silence)
+            # play_silence_duration(channel_id, random_silence)
 
-        elif session["dialed_extension"] == "3000" or current_node.action_to_take.inject_type == "Speech":
-            if session["ivr_step_number"] == 1:
-                play_audio(channel_id, current_node.action_to_take.value)
-            elif session["ivr_step_number"] == 2:
-                play_audio(channel_id, current_node.action_to_take.value)
-            else:
-                play_audio(channel_id, current_node.action_to_take.value)
-
-        elif session["dialed_extension"] == "4000"  or current_node.action_to_take.inject_type == "TTS":
-            if session["ivr_step_number"] == 1:
-                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
-                play_audio(channel_id, base_filename)
-            elif session["ivr_step_number"] == 2:
-                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
-                play_audio(channel_id, base_filename)
-            else:
-                reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
-                play_audio(channel_id, base_filename)
-
-        elif session["dialed_extension"] == "5000" or current_node.action_to_take.inject_type == "Silence":
-            if session["ivr_step_number"] == 1:
-                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
-            elif session["ivr_step_number"] == 2:
-                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
-            else:
-                play_silence_duration(channel_id, random.randint(current_node.action_to_take.value.split("-")[0], current_node.action_to_take.value.split("-")[1]))
-
-            print("IVR Step Number:", session["ivr_step_number"])
-
-            print("TRANSITIONS: ",current_node.transitions)
+            
+        print("NEXT TRANSITIONS: ",current_node.transitions)
 
         # Insert Test History Data into the DB
         record_test_history(session)
@@ -527,11 +494,11 @@ def play_silence_duration(channel_id, seconds):
     #     json={"media": f"sound:silence/{seconds}"}
     # )
 
+    print("Silence period initiated: waiting for seconds:", seconds)
+
     time.sleep(seconds)
 
-    print("Silence playback response:", r.status_code, r.text)
-
-    return r
+    print("Silence period completed:")
 
 def play_audio_bridge(channel_id, sound):
 
