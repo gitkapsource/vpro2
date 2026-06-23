@@ -260,10 +260,8 @@ def write_transcript(channel_id, speaker, text):
 
 def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_id):
 
-    expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
+    #expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
     #nodedata_match = match_nodedata(expected_prompt, transcript_text)
-
-    result = validate_prompts(expected_prompt,transcript_text)
 
     #print("Tag Match Result: ", result)      
 
@@ -272,9 +270,6 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     if session:
         print("Session Captured Variables:",session["captured_variables"])
-
-        if (result.captured_variables and any(result.captured_variables.values())):
-            session["captured_variables"].update(result.captured_variables)
 
         print("Session Object: ",session)
         session["ivr_step_number"] += 1
@@ -296,6 +291,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         # For debugging print the node test details
         print_node_test_details(current_node)
         
+        # Validate Expected_Text vs Actual_Text
+        result = validate_prompts(current_node.expected_text,transcript_text)
+        
+        if (result.captured_variables and any(result.captured_variables.values())):
+            session["captured_variables"].update(result.captured_variables)
+
         session["node_result"] = {
             "node_id": session["ivr_step_number"], #session["current_node_id"],
             "expected_text": session["expected_text"],
