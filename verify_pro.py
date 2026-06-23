@@ -14,7 +14,8 @@ from groq import Groq
 from rapidfuzz import fuzz
 from prompt_validator import validate
 from vpro_json_parser import IVRTestCase
-import mysql.connector
+from db_connection import get_db_conn
+
 import re
 from difflib import SequenceMatcher
 
@@ -802,6 +803,7 @@ def on_ari(ws, message):
 
         ext_media = create_external_media()
         
+        # Initiating Call Session Array
         call_sessions[channel_id] = {
             # Call-specific
             "call_id": None,
@@ -831,7 +833,7 @@ def on_ari(ws, message):
 
             # Test execution
             "ivr_step_number":0,
-            "test_execution_row_id": 12458,
+            "test_execution_row_id": int(time.monotonic()/1000), #12459, #
             "phone_to_dial": "+18005550199",
             "current_node_id": None,
             "execution_status": "RUNNING",
@@ -987,27 +989,8 @@ def record_test_history(session):
             %s,%s,%s,%s,%s,%s,%s,%s,current_timestamp()
             )
             """
-
-        #     VALUES(
-        #     '{session["test_execution_row_id"]}', 
-        #     '{session["node_result"]["node_id"]}', 
-        #     '0.00', 
-        #     '0.00', 
-        #     '{session["node_result"]["actual_text"]}', 
-        #     '{session["node_result"]["transcription_match"]}',
-        #     '{session["node_result"]["response_time"]}', 
-        #     {session["node_result"]["test_result"]}, 
-        #     current_timestamp())
-        # """
-
-    # Initiate DB Connection
-    conn = mysql.connector.connect(
-        host="demo-db.cw5iuewmdvyf.ap-south-1.rds.amazonaws.com",
-        user="w3buser",
-        password="D8p4uW38U$3r",
-        database="kcdb",
-        port=33306
-    )
+    
+    conn = get_db_conn()
 
     cursor = conn.cursor()
 
@@ -1034,7 +1017,7 @@ def record_test_history(session):
         # 6. Get the auto-incremented ID (Optional)
         print(f"Successfully inserted. New Row ID: {cursor.lastrowid}")
 
-    except mysql.connector.Error as err:
+    except Exception as err:
         print(f"Error: {err}")
         conn.rollback() # Undo changes if an error happens
 
