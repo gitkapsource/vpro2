@@ -121,6 +121,10 @@ def rtp_receiver():
         if is_speech_packet(payload):
             #print("Speech packet")
 
+            if session["next_prompt_heard"] == 0:
+                # print("Next Prompt Heard for this Session:", session)
+                session["next_prompt_heard"] = 1
+
             if session["bot_rtp_start_time"] > 0:
                 print("\n",session["voicebot_channel"],":Bot RTP Start Time was:", session["bot_rtp_start_time"],"Current Time is:",time.monotonic())
                 session["bot_last_rtp_time"] = time.monotonic()
@@ -152,7 +156,9 @@ def rtp_receiver():
 
 def start_stt(channel_id):
 
-    url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+    url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&model=nova-3&language=multi"
+    # url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+
 
     headers = [
         f"Authorization: Token {DEEPGRAM_API_KEY}"
@@ -267,8 +273,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
     session = call_sessions[parent_channel_id]
 
-
     if session:
+        # Resetting next_prompt_heard session variable
+        session["next_prompt_heard"] = 0
+
         print("Session Captured Variables:",session["captured_variables"])
 
         print("Session Object: ",session)
@@ -306,20 +314,17 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             "test_result": json.dumps(asdict(result),ensure_ascii=False),
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ") #"2026-06-22T18:21:55Z" 
         }
-    
+
+        # Insert Test History Data into the DB
+        record_test_history(session)
+
         try:
             if current_node.persona:
                 for language_code in current_node.persona:
                     if current_node.persona[language_code]["VI"]:
                         print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
 
-            # if current_node.action_to_take:
-            #     print("INJECT TYPE: ", current_node.action_to_take.inject_type)
-            #     print("ACTION DATA: ", current_node.action_to_take.value)
-
-            #     for var_name, var_value in session["captured_variables"].items():
-            #         print(f"Variables Captured so far: {var_name} = {var_value}")
-
+            # Let's replace the Choice Tag Captured Variables being used in the Reply With Text with corresponding Values
             if current_node.action_to_take:
                 action_value = str(current_node.action_to_take.value)
 
@@ -333,11 +338,11 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
                 print("Updated action value:", current_node.action_to_take.value)
 
-                
+            # Looks like a Promopt which does not expect any Reply / Input    
             else:
                 print("No Action to take: Let's Skip this Node")
                 # Insert Test History Data into the DB
-                record_test_history(session)
+                # record_test_history(session)
 
                 # Evaluate the Next Node ID
                 next_node_id = current_node.transitions.get("on_success")
@@ -349,7 +354,6 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                         session["current_node_id"] = current_node.node_id
                     else:
                         session["current_node_id"] = "EOF"
-
                 return
 
         except:
@@ -374,14 +378,18 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             play_silence(channel_id, random_silence)
             # play_silence_duration(channel_id, random_silence)
 
-            
         print("NEXT TRANSITIONS: ",current_node.transitions)
 
-        # Insert Test History Data into the DB
-        record_test_history(session)
+        # Wait for next_prompt_heard till timeout
+        result = wait_next_response_till_timeout(session, current_node.timeout)
 
-        # Evaluate the Next Node ID
-        next_node_id = current_node.transitions.get("on_success")
+        if result["status"] == "timeout":
+            print("Prompt timeout occurred after DTMF")
+            next_node_id = current_node.transitions.get("on_timeout")
+        else:
+            print("Prompt heard within timeout")
+            # Evaluate the Next Node ID
+            next_node_id = current_node.transitions.get("on_success")
 
         if next_node_id:
             print("Next Node ID: ", next_node_id)
@@ -394,7 +402,29 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
     else:
         print("Session Not Found for IVR Traversal") 
 
-        
+
+def wait_next_response_till_timeout(session, timeout=8):
+
+    print(f"Waiting for {timeout} seconds for the Next Response ")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+
+        if session["next_prompt_heard"] == 1:
+            return {
+                "status": "success",
+                "prompt": "Prompt Heard within {timeout} seconds",
+                "time": time.time() - start_time
+            }
+
+        time.sleep(0.5)
+
+    return {
+        "status": "timeout",
+        "message": f"No prompt heard within {timeout} seconds",
+        "time": time.time() - start_time
+    }
+
 def match_nodedata(expected_prompt, actual_prompt):
 
     # Entire sentence similarity
@@ -487,7 +517,7 @@ def play_audio(channel_id, sound):
         json={"media": f"sound:{sound}"}
     )
 
-    print("beep response:", r)
+    print("Audio response:", r)
 
 def play_silence(channel_id, seconds):
 
@@ -767,6 +797,7 @@ def on_ari(ws, message):
             print("Test Case could not be parsed")
             return
 
+        # Initiate beep audio to help other end learn our RTP Public IP Address
         play_audio(channel_id, "beep")
     
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -777,6 +808,8 @@ def on_ari(ws, message):
 
         bridge_id = create_bridge()
 
+        # Pass the Language Code to the Realtime STT
+        #test_case.get_start_node().language_ids
         stt_ws = start_stt(channel_id)
 
         ext_media = create_external_media()
@@ -815,6 +848,7 @@ def on_ari(ws, message):
             "phone_to_dial": "+18005550199",
             "current_node_id": None,
             "execution_status": "RUNNING",
+            "next_prompt_heard": 0,
 
             # Node results
             "node_result": [],
