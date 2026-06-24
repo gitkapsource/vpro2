@@ -115,8 +115,14 @@ def rtp_receiver():
 
                     break
 
+        #Yet not found session
         if not session:
             continue
+        
+        #At this stage we have the session object
+        if session["node_transition"] == 1:
+            session["node_transition"] = 0
+            print("Next Node Audio")
         
         if is_speech_packet(payload):
             #print("Speech packet")
@@ -341,8 +347,6 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             # Looks like a Promopt which does not expect any Reply / Input    
             else:
                 print("No Action to take: Let's Skip this Node")
-                # Insert Test History Data into the DB
-                # record_test_history(session)
 
                 # Evaluate the Next Node ID
                 next_node_id = current_node.transitions.get("on_success")
@@ -353,11 +357,20 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     if current_node:
                         session["current_node_id"] = current_node.node_id
                     else:
-                        session["current_node_id"] = "EOF"
+                        session["current_node_id"] = "EOF" #Set End Of Flow here
+                        # End the Test Case
+                        print("End Of Test Case Detected, Ending the TestCall")
+                        hangup_channel(channel_id)
+                        return
+
+                session["node_transition"] = 1
+
                 return
 
         except:
             pass
+
+
 
         # Response generation based on Node Data
         print("IVR Step Number:", session["ivr_step_number"])
@@ -378,6 +391,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             play_silence(channel_id, random_silence)
             # play_silence_duration(channel_id, random_silence)
 
+
         print("NEXT TRANSITIONS: ",current_node.transitions)
 
         # Wait for next_prompt_heard till timeout
@@ -397,10 +411,17 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             if current_node:
                 session["current_node_id"] = current_node.node_id
             else:
-                session["current_node_id"] = "EOF"
+                session["current_node_id"] = "EOF" #currently node_fail_hangup matches here as Node Information is not available
+                # End the Test Case
+                print("End Of Test Case Detected, Ending the TestCall")
+                hangup_channel(channel_id)
+                return
 
+        session["node_transition"] = 1
     else:
-        print("Session Not Found for IVR Traversal") 
+        print("Session Not Found for IVR Traversal")
+
+    return
 
 
 def wait_next_response_till_timeout(session, timeout=8):
@@ -504,20 +525,59 @@ def synthesize_speech_polly(text, base_filename, language_code="en-US", voice_id
     return ulaw_file
 
 ################################################
-# PLAY AUDIO TO THE VOICEBOT CHANNEL
+# PLAY AUDIO TO THE VOICEBOT CHANNEL (ASYNCHRONOUS)
+################################################
+
+# def play_audio(channel_id, sound):
+
+#     print("Audio playback for DTMF check:", sound)
+
+#     r= requests.post(
+#         f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
+#         auth=(ARI_USER, ARI_PASS),
+#         json={"media": f"sound:{sound}"}
+#     )
+
+#     print("Audio response:", r)
+
+################################################
+# PLAY AUDIO TO THE VOICEBOT CHANNEL (SYNCHRONOUS)
 ################################################
 
 def play_audio(channel_id, sound):
 
-    print("Audio playback for DTMF check:", sound)
-
-    r= requests.post(
+    r = requests.post(
         f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
         auth=(ARI_USER, ARI_PASS),
         json={"media": f"sound:{sound}"}
     )
 
-    print("Audio response:", r)
+    playback = r.json()
+    playback_id = playback["id"]
+
+    print("Audio Playback started:", playback_id)
+
+    while True:
+
+        r = requests.get(
+            f"{ASTERISK_URL}/ari/playbacks/{playback_id}",
+            auth=(ARI_USER, ARI_PASS)
+        )
+
+        if r.status_code == 404:
+            break
+
+        state = r.json().get("state")
+
+        if state == "done":
+            break
+
+        time.sleep(0.1)
+
+    print("Audio Playback finished")
+
+    return
+
 
 def play_silence(channel_id, seconds):
 
@@ -531,7 +591,31 @@ def play_silence(channel_id, seconds):
 
     print("Silence playback response:", r.status_code, r.text)
 
-    return r
+    playback = r.json()
+    playback_id = playback["id"]
+
+    print("Silence Playback started:", playback_id)
+
+    while True:
+
+        r = requests.get(
+            f"{ASTERISK_URL}/ari/playbacks/{playback_id}",
+            auth=(ARI_USER, ARI_PASS)
+        )
+
+        if r.status_code == 404:
+            break
+
+        state = r.json().get("state")
+
+        if state == "done":
+            break
+
+        time.sleep(0.1)
+
+    print("Silence Playback finished")
+
+    return
 
 def play_silence_duration(channel_id, seconds):
 
@@ -847,6 +931,7 @@ def on_ari(ws, message):
             "test_execution_row_id": int(time.monotonic()/1000), #Temporary Logic for Dynamic Value
             "phone_to_dial": "+18005550199",
             "current_node_id": None,
+            "node_transition": 0,
             "execution_status": "RUNNING",
             "next_prompt_heard": 0,
 
