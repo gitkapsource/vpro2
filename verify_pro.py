@@ -293,7 +293,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         
         # Validate Expected_Text vs Actual_Text
         result = validate_prompts(current_node.expected_text,transcript_text)
-        
+
         if (result.captured_variables and any(result.captured_variables.values())):
             session["captured_variables"].update(result.captured_variables)
 
@@ -313,9 +313,27 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     if current_node.persona[language_code]["VI"]:
                         print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
 
+            # if current_node.action_to_take:
+            #     print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+            #     print("ACTION DATA: ", current_node.action_to_take.value)
+
+            #     for var_name, var_value in session["captured_variables"].items():
+            #         print(f"Variables Captured so far: {var_name} = {var_value}")
+
             if current_node.action_to_take:
-                print("INJECT TYPE: ", current_node.action_to_take.inject_type)
-                print("ACTION DATA: ", current_node.action_to_take.value)
+                action_value = str(current_node.action_to_take.value)
+
+                for var_name, var_value in session["captured_variables"].items():
+                    placeholder = f"${{{var_name}}}"
+
+                    if placeholder in action_value:
+                        action_value = action_value.replace(placeholder, str(var_value))
+
+                current_node.action_to_take.value = action_value
+
+                print("Updated action value:", current_node.action_to_take.value)
+
+                
             else:
                 print("No Action to take: Let's Skip this Node")
                 # Insert Test History Data into the DB
