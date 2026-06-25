@@ -302,6 +302,14 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         session["current_node_id"] = current_node.node_id
         session["expected_text"] = current_node.expected_text
 
+        # Replace {$variable} with value for Expected Text
+        for var_name, var_value in session["captured_variables"].items():
+            # placeholder = f"${{{var_name}}}" # to match variable like ${x}
+            placeholder = f"{{${var_name}}}" # to match variable like {$x}
+
+            if placeholder in current_node.expected_text:
+                current_node.expected_text = current_node.expected_text.replace(placeholder, str(var_value))
+
         # For debugging print the node test details
         print_node_test_details(current_node)
         
@@ -334,8 +342,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             if current_node.action_to_take:
                 action_value = str(current_node.action_to_take.value)
 
+                # Replace {$variable} with value for Action Item
                 for var_name, var_value in session["captured_variables"].items():
-                    placeholder = f"${{{var_name}}}"
+                    # placeholder = f"${{{var_name}}}" # to match variable like ${x}
+                    placeholder = f"{{${var_name}}}" # to match variable like {$x}
 
                     if placeholder in action_value:
                         action_value = action_value.replace(placeholder, str(var_value))

@@ -17,10 +17,13 @@ Supported tags (any combination):
   {Optional text}            Phrase is optional (not scored)
   {*} / {wildcard}           Wildcard — absorbs text up to the next anchor (both spellings are identical)
   {BypassRecognition}        Always returns 100% match, ignores everything after it
+  {BargeIn}                  Text before this tag is matched normally; template text after
+                              it is dropped entirely (no audio exists past the barge-in point)
 
 match_percentage = matched_units / total_units × 100
   • {Optional} and {*}/{wildcard} are not counted in total_units
   • {BypassRecognition} short-circuits to 100% immediately
+  • {BargeIn} truncates the contract — only text before it is ever scored
   • Choice variable=value pairs are returned in result.captured_variables
 """
 
@@ -225,6 +228,11 @@ def _literal_to_regex(text: str) -> str:
     return esc
 
 
+def _is_bargein_tag(tag_value: str) -> bool:
+    """True if this tag is {BargeIn} (case-insensitive, tolerant of stray spaces/hyphens)."""
+    return re.sub(r"[\s\-]", "", tag_value.strip().upper()) == "BARGEIN"
+
+
 def _tag_to_regex(tag: str, language: str) -> str:
     """Convert tag content (without braces) to a regex fragment."""
     t  = tag.strip()
@@ -243,6 +251,8 @@ def _tag_to_regex(tag: str, language: str) -> str:
         return "(?:" + "|".join(f"(?:{p})" for p in pats) + ")"
     if tu == "BYPASSRECOGNITION":
         return r"(?:.*)"   # matches everything (used in full-regex path)
+    if _is_bargein_tag(t):
+        return r"(?:.*)"   # safety fallback; main paths handle {BargeIn} before reaching here
 
     m = re.match(r"DIGITS(?:\s+LENGTH=(\d+)(?:-(\d+))?)?$", tu)
     if m:
@@ -290,6 +300,11 @@ def build_regex(template: str, language: str = "en-US") -> str:
         if kind == "tag" and value.strip().upper() == "BYPASSRECOGNITION":
             frags.append(r"(?:.*)")
             break
+        # BargeIn: text before the tag is matched normally; text after it is
+        # dropped entirely (no audio exists past the barge-in point), so we
+        # add no fragment for it and stop — the anchor lands right here.
+        if kind == "tag" and _is_bargein_tag(value):
+            break
         if kind == "tag":
             frags.append(_tag_to_regex(value, language))
         else:
@@ -318,7 +333,7 @@ def _extract_scored_units(template: str, language: str) -> list:
       regex       — compiled Pattern (used for non-length-constrained tags)
       optional    — bool: True for {Optional}, {*}, {BypassRecognition}
       kind        — "literal" | "tag"
-      tag_type    — for tags: "DIGITS"|"ALPHANUM"|"CHOICE"|"WILDCARD"|"BYPASS"|"OTHER"
+      tag_type    — for tags: "DIGITS"|"ALPHANUM"|"CHOICE"|"WILDCARD"|"BYPASS"|"BARGEIN"|"OTHER"
       lo, hi      — for DIGITS/ALPHANUM: length range
       choice_meta — for CHOICE: (varname, [(phrase, value), ...])
     """
@@ -353,6 +368,19 @@ def _extract_scored_units(template: str, language: str) -> list:
                 "tag_type": "BYPASS",
             })
             break   # nothing after BypassRecognition is scored
+
+        # BargeIn: everything before this tag is matched/scored normally;
+        # any template text after it is dropped — there's no audio for it,
+        # since recognition stops the moment the barge-in timer expires.
+        if _is_bargein_tag(t):
+            units.append({
+                "label":    "{" + t + "}",
+                "regex":    None,
+                "optional": True,
+                "kind":     "tag",
+                "tag_type": "BARGEIN",
+            })
+            break   # nothing after {BargeIn} is scored
 
         is_optional = tu.startswith("OPTIONAL") or t == "*" or tu == "WILDCARD"
 
@@ -452,6 +480,13 @@ def _score_partial(units: list, actual: str) -> tuple:
 
         # ── BypassRecognition ──────────────────────────────────────────────────
         if tag_type == "BYPASS":
+            breakdown.append((label, True, None))
+            i += 1
+            break
+
+        # ── BargeIn: marker only — preceding units already scored normally;
+        #             nothing after this point was ever part of the contract ──
+        if tag_type == "BARGEIN":
             breakdown.append((label, True, None))
             i += 1
             break
@@ -757,6 +792,20 @@ def _run_tests():
         ("Hello. {BypassRecognition} ignore rest",
          "completely different text", "en-US", True, 100.0, {}),
 
+        # ── BargeIn ───────────────────────────────────────────────────────────
+        # Text before the tag must still match normally; text after it in the
+        # template is dropped — there's no audio for it past the barge-in point.
+        ("Welcome to the bank. {BargeIn} Please hold while we transfer you",
+         "Welcome to the bank.", "en-US", True, 100.0, {}),
+        ("Welcome to the bank. {BargeIn} Please hold while we transfer you",
+         "Welcome to the wrong place.", "en-US", False, 0.0, {}),
+        ("Your PIN is {Digits Length=4}. {BargeIn} Thank you for calling",
+         "Your PIN is 1 2 3 4.", "en-US", True, 100.0, {}),
+        ("Your PIN is {Digits Length=4}. {BargeIn} Thank you for calling",
+         "Your PIN is 1 2 3.", "en-US", False, 50.0, {}),
+        ("Good {Choice morning|afternoon|evening}, your balance is {BargeIn} due in full",
+         "Good afternoon, your balance is", "en-US", True, 100.0, {}),
+
         # ── Wildcard ──────────────────────────────────────────────────────────
         ("{*} Your balance is {Currency} rupees",
          "Your balance is twenty rupees", "en-US", True, 100.0, {}),
@@ -855,6 +904,7 @@ Examples:
   python prompt_validator.py "{wildcard} from {Date} to {Date}" "Flights from June 4th to June 10th"
   python prompt_validator.py "Balance is {Currency}" "Balance is two pounds" en-GB
   python prompt_validator.py "{BypassRecognition}" "any audio"
+  python prompt_validator.py "Welcome to the bank. {BargeIn} please hold" "Welcome to the"
 """
 
 
