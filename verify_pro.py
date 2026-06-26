@@ -33,13 +33,13 @@ from logging.handlers import RotatingFileHandler
 log_queue = queue.Queue()
 
 file_handler = RotatingFileHandler(
-    "verifypro.log",
+    "/var/log/verifypro.log",
     maxBytes=50 * 1024 * 1024,
     backupCount=10
 )
 
 formatter = logging.Formatter(
-    "[%(asctime)s] [%(callid)s] %(message)s"
+    "[%(asctime)s] [%(callid)s] [%(testid)s] %(message)s"
 )
 
 file_handler.setFormatter(formatter)
@@ -233,7 +233,7 @@ def on_stt(ws, message, channel_id):
 
     if transcript.strip():
 
-        logger.info(f"on_stt: Transcript:{transcript}", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"on_stt: Transcript:{transcript}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         session["transcript"] += " " + transcript
 
@@ -257,7 +257,7 @@ def on_stt(ws, message, channel_id):
 
     elif session["transcript"]:
 
-        logger.info(f"on_stt: Current Transcript:{session['transcript']}", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"on_stt: Current Transcript:{session['transcript']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         process_transcript = session["transcript"]
         session["transcript"] = ""
@@ -273,7 +273,7 @@ def on_stt(ws, message, channel_id):
         ).start()
 
     else:
-        logger.info(f"on_stt: Skipping Action", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"on_stt: Skipping Action", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
         
 ################################################
 # WRITE TRANSCRIPT TO A FILE
@@ -848,7 +848,7 @@ def on_ari(ws, message):
         channel_id = event["channel"]["id"]
         channel_name = event["channel"]["name"].split(";")[0]
 
-        print("KAPS KAPS KAPS Event Type:", event["type"], " for Channel ID: ", channel_id, " channel_name" ,channel_name)
+        print("Event Type:", event["type"], " for Channel ID: ", channel_id, " channel_name" ,channel_name)
 
 
         for cid, s in call_sessions.items():
@@ -1011,12 +1011,12 @@ def on_ari(ws, message):
 
     else:
         session = call_sessions[parent_channel]
-        logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         session["bot_connect_time"] = time.monotonic()
         session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
 
-        logger.info(f"Adding voicebot to bridge", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"Adding voicebot to bridge", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         session["voicebot_channel"] = channel_id
         session["voicebot_channel_name"] = channel_name.split(";")[0]
@@ -1144,7 +1144,7 @@ def record_test_history(session):
 
     try:
         
-        logger.info(f"Insert SQL : {sql}", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"Insert SQL : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         # 4. Execute the query
         cursor.execute(sql,
@@ -1163,7 +1163,7 @@ def record_test_history(session):
         conn.commit()
     
         # 6. Get the auto-incremented ID (Optional)
-        logger.info(f"Successfully inserted. New Row ID: {cursor.lastrowid}", extra={"callid":session.get("call_id", "UNKNOWN")})
+        logger.info(f"Successfully inserted. New Row ID: {cursor.lastrowid}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
     except Exception as err:
         print(f"Error: {err}")
@@ -1188,7 +1188,7 @@ def cleanup_call(session):
 
     print(bridge_id, caller, voicebot, external_media, stt_ws, sep=" | ")
 
-    logger.info(f"Cleaning up call", extra={"callid":session.get("call_id", "UNKNOWN")})
+    logger.info(f"Cleaning up call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
 
     # session = call_sessions.get(channel_id)
@@ -1247,14 +1247,14 @@ def cleanup_call(session):
 
     try:
         if session.get("rtp_addr") in rtp_sessions:
-            logger.info(f"Deleting RTP Session Map: {rtp_sessions[session['rtp_addr']]}", extra={"callid":session.get("call_id", "UNKNOWN")})
+            logger.info(f"Deleting RTP Session Map: {rtp_sessions[session['rtp_addr']]}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             del rtp_sessions[session["rtp_addr"]]
     except:
         pass
 
     try:
         if stt_ws:
-            logger.info(f"Deleting STT WS: {stt_ws}", extra={"callid":session.get("call_id", "UNKNOWN")})
+            logger.info(f"Deleting STT WS: {stt_ws}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             stt_ws.close()
     except:
         pass
@@ -1262,7 +1262,7 @@ def cleanup_call(session):
     # if channel_id in call_sessions:
     #     del call_sessions[channel_id]
 
-    logger.info(f"Call cleanup completed; Now deleting Session", extra={"callid":session.get("call_id", "UNKNOWN")})
+    logger.info(f"Call cleanup completed; Now deleting Session", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
     del session
 
 
