@@ -962,9 +962,11 @@ def on_ari(ws, message):
             "rtp_addr": None,
 
             # Voicebot Channel RTP specific
-            "bot_dial_time":time.monotonic(),
+            "bot_dial_time":datetime.datetime.now(),
             "bot_connect_time":0,
             "bot_answer_duration":0,
+            "bot_end_time":0,
+            "call_ended_by":0,
             "bot_last_rtp_time":0,
             "bot_rtp_start_time":0,
             "bot_avg_latency":0,
@@ -976,8 +978,8 @@ def on_ari(ws, message):
 
             # Test execution
             "ivr_step_number":0,
-            "test_execution_row_id": int(time.monotonic()/1000), #Temporary Logic for Dynamic Value
-            "phone_to_dial": "+18005550199",
+            "test_execution_row_id": 2618, #Temporary Logic for Dynamic Value
+            "phone_to_dial": test_case.meta.phone_to_dial, #"+18005550199",
             "current_node_id": None,
             "node_transition": 0,
             "execution_status": "RUNNING",
@@ -1012,10 +1014,16 @@ def on_ari(ws, message):
 
     else:
         session = call_sessions[parent_channel]
-        logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        logger.info(f"Caller Channel is Available", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
-        session["bot_connect_time"] = time.monotonic()
+        session["bot_connect_time"] = datetime.datetime.now()
         session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
+        session["pdd"] = round((session["bot_connect_time"] - session["bot_dial_time"]).total_seconds() * 1000,2) # to be changed with 1xx response logic
+
+        logger.info(f"Dial Time: {session['bot_dial_time']}, Connect Time: {session['bot_connect_time']}, PDD: {session['pdd']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        # Update test row execution history table with Call Start Information
+        update_test_history(session, 0)
 
         logger.info(f"Adding voicebot to bridge", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
@@ -1145,7 +1153,7 @@ def record_test_history(session):
 
     try:
         
-        logger.info(f"Insert SQL : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        logger.info(f"Insert Node Test Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         # 4. Execute the query
         cursor.execute(sql,
@@ -1176,6 +1184,84 @@ def record_test_history(session):
         conn.close()
 
 ################################################
+# UPDATE TEST HISTORY INTO THE DATABASE
+################################################
+def update_test_history(session, stage=0):
+
+    try:
+        if stage == 0:
+            sql = f""" 
+                    UPDATE kcdb.verify_pro_test_execution_row_history
+                    SET
+                    start_time = %s,
+                    connect_time = %s,
+                    pdd = %s,
+                    callid = %s,
+                    processed = %s,
+                    status = %s
+                    WHERE
+                    id = %s
+                    """
+                    # end_time = %s,
+                    # call_ended_by = %d,
+
+            conn = get_db_conn()
+            cursor = conn.cursor()
+            logger.info(f"Update Test Row Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+            # 4. Execute the query
+            cursor.execute(sql,
+                (
+                session["bot_dial_time"], 
+                session["bot_connect_time"], 
+                session["pdd"],
+                session["call_id"],
+                1,
+                0,
+                session["test_execution_row_id"]
+                ))
+        else:
+            sql = f""" 
+                    UPDATE kcdb.verify_pro_test_execution_row_history
+                    SET
+                    end_time = %s,
+                    call_ended_by = %s,
+                    processed = %s,
+                    status = %s
+                    WHERE
+                    id = %s
+                    """
+
+            conn = get_db_conn()
+            cursor = conn.cursor()
+            logger.info(f"Update Test Row Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+            # 4. Execute the query
+            cursor.execute(sql,
+                (
+                session["bot_end_time"],
+                session["call_ended_by"], 
+                2,
+                1,
+                session["test_execution_row_id"]
+                ))
+                
+        # 5. COMMIT THE TRANSACTION (Crucial for INSERT, UPDATE, DELETE)
+        conn.commit()
+
+        # 6. Get the auto-incremented ID (Optional)
+        logger.info(f"Successfully updated. Updated Row ID: {cursor.lastrowid}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+    except Exception as err:
+        print(f"Error: {err}")
+        conn.rollback() # Undo changes if an error happens
+
+    finally:
+        # 7. Close connections
+        cursor.close()
+        conn.close()
+
+################################################
 # HANGUP EVENT HANDLER
 ################################################
 
@@ -1191,6 +1277,9 @@ def cleanup_call(session):
 
     logger.info(f"Cleaning up call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
+    # Update test row execution history table with Call Start Information
+    session["bot_end_time"] = datetime.datetime.now()
+    update_test_history(session, 1)
 
     # session = call_sessions.get(channel_id)
 
