@@ -319,9 +319,9 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         # Resetting next_prompt_heard session variable
         session["next_prompt_heard"] = 0
 
-        print("Session Captured Variables:",session["captured_variables"])
+        logger.info(f"Session Captured Variables:{session['captured_variables']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        logger.info(f"Session Object:{session}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
-        print("Session Object: ",session)
         session["ivr_step_number"] += 1
 
         # Set Test Data Node Data and Result
@@ -329,8 +329,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         if session["current_node_id"] is None:
             current_node = session["test_case"].get_start_node()
         elif session["current_node_id"] == "EOF":
-            print("End Of Test Case Detected, Ending the TestCall")
-            hangup_channel(channel_id)
+            logger.info(f"End Of Test Case Detected, Ending the TestCall", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            hangup_channel(session, channel_id)
             return
         else:
             current_node = session["test_case"].get_node(session["current_node_id"])
@@ -347,7 +347,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                 current_node.expected_text = current_node.expected_text.replace(placeholder, str(var_value))
 
         # For debugging print the node test details
-        print_node_test_details(current_node)
+        # print_node_test_details(session, current_node)
         
         # Validate Expected_Text vs Actual_Text
         result = validate_prompts(current_node.expected_text,transcript_text)
@@ -372,7 +372,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             if current_node.persona:
                 for language_code in current_node.persona:
                     if current_node.persona[language_code]["VI"]:
-                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+                        logger.info(f"Persona: {language_code}: VoiceID: {current_node.persona[language_code]['VI']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
             # Let's replace the Choice Tag Captured Variables being used in the Reply With Text with corresponding Values
             if current_node.action_to_take:
@@ -387,26 +387,25 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                         action_value = action_value.replace(placeholder, str(var_value))
 
                 current_node.action_to_take.value = action_value
-
-                print("Updated action value:", current_node.action_to_take.value)
+                logger.info(f"Updated action value: {current_node.action_to_take.value}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
             # Looks like a Promopt which does not expect any Reply / Input    
             else:
-                print("No Action to take: Let's Skip this Node")
+                logger.info(f"No Action to take: Let's Skip this Node", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
                 # Evaluate the Next Node ID
                 next_node_id = current_node.transitions.get("on_success")
 
                 if next_node_id:
-                    print("Next Node ID: ", next_node_id)
+                    logger.info(f"Next Node ID: {next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
                     current_node = session["test_case"].get_node(next_node_id)
                     if current_node:
                         session["current_node_id"] = current_node.node_id
                     else:
                         session["current_node_id"] = "EOF" #Set End Of Flow here
                         # End the Test Case
-                        print("End Of Test Case Detected, Ending the TestCall")
-                        hangup_channel(channel_id)
+                        logger.info(f"End Of Test Case Detected, Ending the TestCall", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+                        hangup_channel(session, channel_id)
                         return
 
                 session["node_transition"] = 1
@@ -416,63 +415,64 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         except:
             pass
 
-
-
         # Response generation based on Node Data
-        print("IVR Step Number:", session["ivr_step_number"])
+        logger.info(f"IVR Step Number:{session['ivr_step_number']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         if current_node.action_to_take.inject_type == "DTMF":
-            send_dtmf(channel_id, current_node.action_to_take.value)
+            send_dtmf(session, channel_id, current_node.action_to_take.value)
 
         elif current_node.action_to_take.inject_type == "Speech":
             play_audio(channel_id, current_node.action_to_take.value)
 
         elif current_node.action_to_take.inject_type == "TTS":
-            reply_path = synthesize_speech_polly(current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
+            reply_path = synthesize_speech_polly(session, current_node.action_to_take.value, base_filename, language_code, current_node.persona[language_code]["VI"])
             play_audio(channel_id, base_filename)
 
         elif current_node.action_to_take.inject_type == "Silence":
             min_val, max_val = map(int,current_node.action_to_take.value.split("-"))
             random_silence = random.randint(min_val, max_val)
-            play_silence(channel_id, random_silence)
+            play_silence(session,channel_id, random_silence)
             # play_silence_duration(channel_id, random_silence)
 
-
-        print("NEXT TRANSITIONS: ",current_node.transitions)
+        logger.info(f"NEXT TRANSITIONS:{current_node.transitions}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         # Wait for next_prompt_heard till timeout
         result = wait_next_response_till_timeout(session, current_node.timeout)
 
         if result["status"] == "timeout":
-            print("Prompt timeout occurred after DTMF")
+            logger.info(f"Prompt timeout occurred after DTMF", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             next_node_id = current_node.transitions.get("on_timeout")
         else:
-            print("Prompt heard within timeout")
+            logger.info(f"Prompt heard within timeout", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            
             # Evaluate the Next Node ID
             next_node_id = current_node.transitions.get("on_success")
 
         if next_node_id:
-            print("Next Node ID: ", next_node_id)
+            logger.info(f"Next Node ID:{next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+           
             current_node = session["test_case"].get_node(next_node_id)
             if current_node:
                 session["current_node_id"] = current_node.node_id
             else:
                 session["current_node_id"] = "EOF" #currently node_fail_hangup matches here as Node Information is not available
                 # End the Test Case
-                print("End Of Test Case Detected, Ending the TestCall")
-                hangup_channel(channel_id)
+                logger.info(f"End Of Test Case Detected, Ending the TestCall", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+                hangup_channel(session, channel_id)
                 return
 
         session["node_transition"] = 1
     else:
-        print("Session Not Found for IVR Traversal")
+        logger.info(f"Session Not Found for IVR Traversal", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
     return
 
 
 def wait_next_response_till_timeout(session, timeout=8):
 
-    print(f"Waiting for {timeout} seconds for the Next Response ")
+    logger.info(f"Waiting for {timeout} seconds for the Next Response", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
     start_time = time.time()
 
     while time.time() - start_time < timeout:
@@ -492,42 +492,42 @@ def wait_next_response_till_timeout(session, timeout=8):
         "time": time.time() - start_time
     }
 
-def match_nodedata(expected_prompt, actual_prompt):
+# def match_nodedata(expected_prompt, actual_prompt):
 
-    # Entire sentence similarity
-    match_percent = similarity(
-        expected_prompt,
-        actual_prompt
-    )
+#     # Entire sentence similarity
+#     match_percent = similarity(
+#         expected_prompt,
+#         actual_prompt
+#     )
 
-    print("\n----- MATCH DETAILS -----")
-    print("Expected :", expected_prompt)
-    print("Actual   :", actual_prompt)
-    print("Match %  :", match_percent)
+#     print("\n----- MATCH DETAILS -----")
+#     print("Expected :", expected_prompt)
+#     print("Actual   :", actual_prompt)
+#     print("Match %  :", match_percent)
 
-    return False
+#     return False
 
 
-def similarity(a, b):
+# def similarity(a, b):
 
-    return round(
-        SequenceMatcher(
-            None,
-            a.lower(),
-            b.lower()
-        ).ratio() * 100,
-        2
-    )
+#     return round(
+#         SequenceMatcher(
+#             None,
+#             a.lower(),
+#             b.lower()
+#         ).ratio() * 100,
+#         2
+#     )
 
-def print_node_test_details(current_node):
+def print_node_test_details(session, current_node):
 
-        print("Language IDs:", current_node.language_ids)
-        print("Persona:", current_node.persona)
+    logger.info(f"Language IDs: {current_node.language_ids}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    logger.info(f"Persona: {current_node.persona}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    logger.info(f"Minor Threshold Time: {current_node.minor_threshold_time}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    logger.info(f"Major Threshold Time: {current_node.major_threshold_time}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    logger.info(f"Minor Confidence Level: {current_node.minor_confidence_level}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    logger.info(f"Major Confidence Level: {current_node.major_confidence_level}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
-        print("Minor Threshold Time:", current_node.minor_threshold_time)
-        print("Major Threshold Time:", current_node.major_threshold_time)
-        print("Minor Confidence Level:", current_node.minor_confidence_level)
-        print("Major Confidence Level:", current_node.major_confidence_level)
     
 
 ################################################
@@ -546,7 +546,7 @@ def synthesize_speech_polly(text, base_filename, language_code="en-US", voice_id
         SampleRate="8000"
     )
 
-    print("TTS Response:",response)
+    logger.info(f"TTS Response: {response}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
     raw_file = f"{base_filename}.pcm"
     ulaw_file = f"{base_filename}.ulaw"
@@ -601,7 +601,7 @@ def play_audio(channel_id, sound):
     playback = r.json()
     playback_id = playback["id"]
 
-    print("Audio Playback started:", playback_id)
+    # print("Audio Playback started:", playback_id)
 
     while True:
 
@@ -620,12 +620,12 @@ def play_audio(channel_id, sound):
 
         time.sleep(0.1)
 
-    print("Audio Playback finished")
+    # print("Audio Playback finished")
 
     return
 
 
-def play_silence(channel_id, seconds):
+def play_silence(session, channel_id, seconds):
 
     print(f"Playing {seconds} seconds of silence")
 
@@ -635,12 +635,12 @@ def play_silence(channel_id, seconds):
         json={"media": f"sound:silence/{seconds}"}
     )
 
-    print("Silence playback response:", r.status_code, r.text)
+    # print("Silence playback response:", r.status_code, r.text)
 
     playback = r.json()
     playback_id = playback["id"]
 
-    print("Silence Playback started:", playback_id)
+    # print("Silence Playback started:", playback_id)
 
     while True:
 
@@ -659,13 +659,13 @@ def play_silence(channel_id, seconds):
 
         time.sleep(0.1)
 
-    print("Silence Playback finished")
+    # print("Silence Playback finished")
 
     return
 
 def play_silence_duration(channel_id, seconds):
 
-    print(f"Playing {seconds} seconds of silence")
+    # print(f"Playing {seconds} seconds of silence")
 
     # r = requests.post(
     #     f"{ASTERISK_URL}/ari/channels/{channel_id}/play",
@@ -673,43 +673,41 @@ def play_silence_duration(channel_id, seconds):
     #     json={"media": f"sound:silence/{seconds}"}
     # )
 
-    print("Silence period initiated: waiting for seconds:", seconds)
+    # print("Silence period initiated: waiting for seconds:", seconds)
 
     time.sleep(seconds)
 
-    print("Silence period completed:")
+    # print("Silence period completed:")
 
-def play_audio_bridge(channel_id, sound):
+# def play_audio_bridge(channel_id, sound):
 
-    session = call_sessions[channel_id]
-    bridge_id = session["bridge_id"]
+#     session = call_sessions[channel_id]
+#     bridge_id = session["bridge_id"]
 
-    print("Audio playback:", sound)
+#     print("Audio playback:", sound)
 
-    requests.post(
-        f"{ASTERISK_URL}/ari/bridges/{bridge_id}/play",
-        auth=(ARI_USER, ARI_PASS),
-        json={"media": f"sound:{sound}"}
-    )
+#     requests.post(
+#         f"{ASTERISK_URL}/ari/bridges/{bridge_id}/play",
+#         auth=(ARI_USER, ARI_PASS),
+#         json={"media": f"sound:{sound}"}
+#     )
 
-def hangup_channel(channel_id):
+def hangup_channel(session, channel_id):
 
     r = requests.delete(
         f"{ASTERISK_URL}/ari/channels/{channel_id}",
         auth=(ARI_USER, ARI_PASS)
     )
 
-    print(
-        f"Hangup channel {channel_id}: "
-        f"{r.status_code}"
-    )
+    logger.info(f"Hangup channel {channel_id}:{r.status_code}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
 
     return r.status_code == 204
 ################################################
 # PLAY DTMF TO THE VOICEBOT CHANNEL
 ################################################
 
-def send_dtmf(channel_id, digits):
+def send_dtmf(session,channel_id, digits):
 
     print("Sending DTMF :", digits, " on channel:", channel_id)
     url = f"{ASTERISK_URL}/ari/channels/{channel_id}/dtmf"
@@ -721,7 +719,8 @@ def send_dtmf(channel_id, digits):
         "duration": 500
     }
 
-    print("Response: ", requests.post(url, params=params, auth=(ARI_USER, ARI_PASS)))
+    r = requests.post(url, params=params, auth=(ARI_USER, ARI_PASS))
+    logger.info(f"Senddtmf Response:{r}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
 ################################################
 # ARI FUNCTIONS
@@ -923,24 +922,21 @@ def on_ari(ws, message):
                 
         sip_call_id = get_pjsip_call_id(channel_id)
 
-        logger.info(f"Stasis Start", extra={"callid":sip_call_id})
+        # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
         #(f"[Exec:{session['test_execution_row_id']}] "
         
         #Let's populate the test cases for this call
         test_case = load_test_case()
         if test_case is None:
-            logger.info(f"Test Case could not be parsed", extra={"callid":sip_call_id})
+            # logger.info(f"Test Case could not be parsed", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
             return
 
-        # Initiate beep audio to help other end learn our RTP Public IP Address
+        # # Initiate beep audio to help other end learn our RTP Public IP Address
         play_audio(channel_id, "beep")
     
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         transcript_file = f"/tmp/voicebot_{channel_id}_{timestamp}.txt"
-
-        print("Caller Channel is Not Available: Fresh Call")
-        logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":sip_call_id})
 
         bridge_id = create_bridge()
 
@@ -1002,11 +998,16 @@ def on_ari(ws, message):
             "test_case": test_case
         }
 
+        session = call_sessions[channel_id]
+        logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":sip_call_id,"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
         open(transcript_file, "a").write(f"CALL START {timestamp}\n")
 
         add_channel_to_bridge(bridge_id, channel_id)
         add_channel_to_bridge(bridge_id, ext_media)
 
+        # Initiate beep audio to help other end learn our RTP Public IP Address
+        # play_audio(call_sessions[channel_id],channel_id, "beep")
         dial_voicebot(channel_id, test_case)
 
     else:
