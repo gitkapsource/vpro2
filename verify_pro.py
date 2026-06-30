@@ -73,7 +73,7 @@ ASTERISK_IP = "127.0.0.1"
 
 SOUNDS_DIR = "/var/lib/asterisk/sounds"
 
-DEEPGRAM_API_KEY = "8451356dec473b846cb24b5dd8e275b2aa2c4a56"
+DEEPGRAM_API_KEY = "c55fbae3b46e73928316d000f602b8b200c9e4d0"
 
 call_sessions = {}
 rtp_sessions = {}
@@ -183,14 +183,16 @@ def rtp_receiver():
         # else:
         #     print("Silence packet")
 
-        ws = session.get("stt_ws")
+        ws = session["stt_ws"]
 
         if ws:
             try:
+                print("Sending payload to ws: ", ws)
                 ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
             except:
                 pass
-
+        else:
+            print("No stt ws available to send audio")
 
 ################################################
 # Deepgram STT
@@ -199,7 +201,7 @@ def rtp_receiver():
 def start_stt(channel_id):
 
     url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&model=nova-3&language=multi"
-    # url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+    #url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
 
 
     headers = [
@@ -224,9 +226,10 @@ def on_stt(ws, message, channel_id):
     data = json.loads(message)
 
     #print(time.time())
-    #print("ON STT: Data Received", data)
+    print("ON STT: Data Received", data)
 
     if "channel" not in data:
+        print("ON STT: Channel not in data, returning", data)
         return
 
     transcript = data["channel"]["alternatives"][0]["transcript"]
@@ -240,6 +243,7 @@ def on_stt(ws, message, channel_id):
         write_transcript(channel_id, "Caller", transcript)
 
         # Let's check the interim Transcript to match any test keywords and barge-in
+        """
         if fuzzy_match(transcript, keywords_list, session) is not None:
 
             process_transcript = session["transcript"]
@@ -254,6 +258,7 @@ def on_stt(ws, message, channel_id):
                 target=process_nodedata,
                 args=(process_transcript, base_path, voicebot_channel_id, channel_id)
             ).start()
+        """
 
     elif session["transcript"]:
 
@@ -320,7 +325,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         session["next_prompt_heard"] = 0
 
         logger.info(f"Session Captured Variables:{session['captured_variables']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-        logger.info(f"Session Object:{session}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        # logger.info(f"Session Object:{session}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         session["ivr_step_number"] += 1
 
@@ -356,10 +361,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             session["captured_variables"].update(result.captured_variables)
 
         session["node_result"] = {
-            "node_id": session["ivr_step_number"], #session["current_node_id"],
+            "node_id": session["current_node_id"],
             "expected_text": session["expected_text"],
             "actual_text": transcript_text,
-            "transcription_match": result.match_percentage,
+            "transcription_match": result.word_match_percentage,#result.match_percentage,
             "response_time": session["bot_avg_latency"],
             "test_result": json.dumps(asdict(result),ensure_ascii=False),
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ") #"2026-06-22T18:21:55Z" 
@@ -798,17 +803,18 @@ def add_channel_to_bridge(bridge, channel):
     )
 
 
-def dial_voicebot(channel_id, test_case):
+def dial_voicebot(channel_id, session):
 
-    print("Originating Voicebot Channel on the Phone Number:", test_case.meta.phone_to_dial)
+    print("Originating Voicebot Channel on the Phone Number:", session["phone_to_dial"])
 
     requests.post(
         f"{ASTERISK_URL}/ari/channels",
         auth=(ARI_USER, ARI_PASS),
         params={
-            "endpoint": f"Local/{test_case.meta.phone_to_dial}@ivr-test-final",
+            "endpoint": f"Local/{session['phone_to_dial']}@ivr-test-final",
             "app": APP_NAME,
-            "appArgs": channel_id
+            "appArgs": channel_id,
+            "callerId": f"Vpro Test <{session['cli']}>"
         }
     )
 
@@ -864,7 +870,8 @@ def on_ari(ws, message):
             channel_id = event["channel"]["id"]
             channel_name = event["channel"]["name"]
     except:
-        print("on_ari: Exception: Some Error for the Event:", event)
+        # print("on_ari: Exception: Some Error for the Event:", event)
+        pass
 
     if event["type"] == "StasisEnd":
 
@@ -922,43 +929,20 @@ def on_ari(ws, message):
                 
         sip_call_id = get_pjsip_call_id(channel_id)
 
-        # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
-        #(f"[Exec:{session['test_execution_row_id']}] "
-        
-        #Let's populate the test cases for this call
-        test_case = load_test_case()
-        if test_case is None:
-            # logger.info(f"Test Case could not be parsed", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
-            return
-
-        # # Initiate beep audio to help other end learn our RTP Public IP Address
-        play_audio(channel_id, "beep")
-    
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        transcript_file = f"/tmp/voicebot_{channel_id}_{timestamp}.txt"
-
-        bridge_id = create_bridge()
-
-        # Pass the Language Code to the Realtime STT
-        #test_case.get_start_node().language_ids
-        stt_ws = start_stt(channel_id)
-
-        ext_media = create_external_media()
-        
         # Initiating Call Session Array
         call_sessions[channel_id] = {
             # Call-specific
             "call_id": sip_call_id,
+            "cli": None,
             "dialed_extension": exten,
             "caller_channel": channel_id,
-            "bridge_id": bridge_id,
+            "bridge_id": None,
             "voicebot_channel": None,
             "voicebot_channel_name": None,
-            "external_media" : ext_media,
+            "external_media" : None,
             "transcript": "",
-            "transcript_file": transcript_file,
-            "stt_ws": stt_ws,
+            "transcript_file": None,
+            "stt_ws": None,
             "rtp_addr": None,
 
             # Voicebot Channel RTP specific
@@ -977,9 +961,10 @@ def on_ari(ws, message):
             "captured_variables": {},
 
             # Test execution
+            "dialed_parameters_snapshot": None,
             "ivr_step_number":0,
-            "test_execution_row_id": 2618, #Temporary Logic for Dynamic Value
-            "phone_to_dial": test_case.meta.phone_to_dial, #"+18005550199",
+            "test_execution_row_id": None, #Temporary Logic for Dynamic Value
+            "phone_to_dial": "+18005550199",
             "current_node_id": None,
             "node_transition": 0,
             "execution_status": "RUNNING",
@@ -997,20 +982,73 @@ def on_ari(ws, message):
             },
 
             # Test Case Data
-            "test_case": test_case
+            "test_case": None
         }
 
         session = call_sessions[channel_id]
         logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":sip_call_id,"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
+
+
+
+        # create stt_ws socket
+        stt_ws = start_stt(channel_id)
+        session["stt_ws"] = stt_ws
+        logger.info(f"stt_ws created: {session['stt_ws']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+
+
+
+        # Fetch the Test Data
+        fetch_test_history(session)
+
+        if session["test_execution_row_id"] is None:
+            logger.info(f"Test Case could not be fetched", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
+            hangup_channel(session, channel_id)
+            return
+
+        #Let's populate the test cases for this call
+        test_case = load_test_case(session)
+        if test_case is None:
+            logger.info(f"Test Case could not be parsed", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
+            hangup_channel(session, channel_id)
+            return
+        
+        session["test_case"] = test_case
+        if test_case.meta.phone_to_dial is not None:
+            session["phone_to_dial"] = test_case.meta.phone_to_dial
+
+        # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
+        #(f"[Exec:{session['test_execution_row_id']}] "
+
+        # # Initiate beep audio to help other end learn our RTP Public IP Address
+        # play_audio(channel_id, "beep")
+    
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        transcript_file = f"/tmp/voicebot_{channel_id}_{timestamp}.txt"
         open(transcript_file, "a").write(f"CALL START {timestamp}\n")
+        session["transcript_file"] = transcript_file
+
+        bridge_id = create_bridge()
+        session["bridge_id"] = bridge_id
+
+        # Pass the Language Code to the Realtime STT
+        #test_case.get_start_node().language_ids
+        # stt_ws = start_stt(channel_id)
+        # session["stt_ws"] = stt_ws
+
+        # logger.info(f"stt_ws created: {session['stt_ws']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        ext_media = create_external_media()
+        session["external_media"] = ext_media
 
         add_channel_to_bridge(bridge_id, channel_id)
         add_channel_to_bridge(bridge_id, ext_media)
 
         # Initiate beep audio to help other end learn our RTP Public IP Address
-        # play_audio(call_sessions[channel_id],channel_id, "beep")
-        dial_voicebot(channel_id, test_case)
+        play_audio(channel_id, "beep")
+        dial_voicebot(channel_id, session)
 
     else:
         session = call_sessions[parent_channel]
@@ -1018,7 +1056,7 @@ def on_ari(ws, message):
 
         session["bot_connect_time"] = datetime.datetime.now()
         session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
-        session["pdd"] = round((session["bot_connect_time"] - session["bot_dial_time"]).total_seconds() * 1000,2) # to be changed with 1xx response logic
+        session["pdd"] = round(((session["bot_connect_time"] - session["bot_dial_time"]).total_seconds() * 1000),2) # to be changed with 1xx response logic
 
         logger.info(f"Dial Time: {session['bot_dial_time']}, Connect Time: {session['bot_connect_time']}, PDD: {session['pdd']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
@@ -1038,14 +1076,20 @@ def on_ari(ws, message):
 # LOAD THE TEST CASE FROM THE IVR TEST JSON
 ################################################
 
-def load_test_case(json_file="ivr_test.json"):
+def load_test_case(session): #, json_file="ivr_test.json"):
     # Load and Parse ivr_test.json Test Case File
-    test_case = json_file_parse(json_file)
+    try:
+        test_case = json_parse(session)
+        # test_case = json_file_parse(session)
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
     if not test_case:
         return None
+    else:
+        print("test case could be loaded")
 
-    print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
+    # print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
     print("_" * 100)
         # print("Language IDs:", test_case.test_model_settings.language_ids)
         # print("Persona:", test_case.test_model_settings.persona)
@@ -1116,18 +1160,67 @@ def load_test_case(json_file="ivr_test.json"):
 
     return test_case
 
+################################################
+# FETCH TEST HISTORY FROM THE DATABASE
+################################################
+def fetch_test_history(session):
+
+    sql = f"""
+        SELECT vpterh.*,pcli.cli 
+        FROM kcdb.verify_pro_test_execution_row_history AS vpterh
+        LEFT OUTER JOIN provider_cli AS pcli
+        ON pcli.id = vpterh.provider_cli_id
+        WHERE vpterh.start_time = '0000-00-00 00:00:00'
+        AND vpterh.end_time = '0000-00-00 00:00:00'
+        AND vpterh.scheduled_on <= NOW()
+        AND vpterh.processed = 0
+        AND vpterh.status = 1
+        ORDER BY vpterh.scheduled_on ASC
+        LIMIT 1
+    """
+
+    conn = get_db_conn()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        
+        logger.info(f"Fetching Test Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        # 4. Execute the query
+        cursor.execute(sql)
+    
+        # 5. COMMIT THE TRANSACTION (Crucial for INSERT, UPDATE, DELETE)
+        # conn.commit()
+    
+        # 6. Get the auto-incremented ID (Optional)
+        # logger.info(f"Successfully inserted. New Row ID: {cursor.lastrowid}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        rows = cursor.fetchall()
+
+        if rows:
+            for row in rows:
+                logger.info(f"Fetched Test Data : ROW HISTORY ID : {row['id']} | CLI: {row['cli']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+                session["test_execution_row_id"] = row["id"]
+                session["cli"] = row["cli"]
+                session["dialed_parameters_snapshot"] = row["dialed_parameters_snapshot"]
+        else:
+            logger.info(f"No Test Data Could be Fetched", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+    except Exception as err:
+        print(f"Error: {err} for {sql}")
+        conn.rollback() # Undo changes if an error happens
+
+    finally:
+        # 7. Close connections
+        cursor.close()
+        conn.close()
+
 
 ################################################
-# RECORD TEST HISTORY INTO THE DATABASE
+# RECORD NODE TEST HISTORY INTO THE DATABASE
 ################################################
 
 def record_test_history(session):
-
-    # bridge_id = session.get("bridge_id")
-    # caller = session.get("caller_channel")
-    # voicebot = session.get("voicebot_channel")
-    # external_media = session.get("external_media")
-    # stt_ws = session.get("stt_ws")
 
     sql = f""" 
             INSERT INTO kcdb.verify_pro_test_execution_row_node_history
@@ -1197,8 +1290,7 @@ def update_test_history(session, stage=0):
                     connect_time = %s,
                     pdd = %s,
                     callid = %s,
-                    processed = %s,
-                    status = %s
+                    processed = %s
                     WHERE
                     id = %s
                     """
@@ -1216,8 +1308,7 @@ def update_test_history(session, stage=0):
                 session["bot_connect_time"], 
                 session["pdd"],
                 session["call_id"],
-                1,
-                0,
+                1, # In Progress
                 session["test_execution_row_id"]
                 ))
         else:
@@ -1226,8 +1317,7 @@ def update_test_history(session, stage=0):
                     SET
                     end_time = %s,
                     call_ended_by = %s,
-                    processed = %s,
-                    status = %s
+                    processed = %s
                     WHERE
                     id = %s
                     """
@@ -1241,8 +1331,7 @@ def update_test_history(session, stage=0):
                 (
                 session["bot_end_time"],
                 session["call_ended_by"], 
-                2,
-                1,
+                2, # Done
                 session["test_execution_row_id"]
                 ))
                 
@@ -1278,8 +1367,13 @@ def cleanup_call(session):
     logger.info(f"Cleaning up call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
     # Update test row execution history table with Call Start Information
-    session["bot_end_time"] = datetime.datetime.now()
-    update_test_history(session, 1)
+    try:
+        if session["test_case"] is not None:
+            logger.info(f"Mark the End Time for this Call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            session["bot_end_time"] = datetime.datetime.now()
+            update_test_history(session, 1)
+    except:
+        pass
 
     # session = call_sessions.get(channel_id)
 
@@ -1337,7 +1431,8 @@ def cleanup_call(session):
 
     try:
         if session.get("rtp_addr") in rtp_sessions:
-            logger.info(f"Deleting RTP Session Map: {rtp_sessions[session['rtp_addr']]}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            # logger.info(f"Deleting RTP Session Map: {rtp_sessions[session['rtp_addr']]}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            logger.info(f"Deleting RTP Session Map:", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             del rtp_sessions[session["rtp_addr"]]
     except:
         pass
@@ -1353,7 +1448,12 @@ def cleanup_call(session):
     #     del call_sessions[channel_id]
 
     logger.info(f"Call cleanup completed; Now deleting Session", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-    del session
+    try:
+        del call_sessions[session["caller_channel"]]
+        del session
+    except:
+        pass
+
 
 
 ################################################
@@ -1371,6 +1471,7 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
     print("Actual Prompt:",actual_prompt)
     print("Matched: ",result.matched)
     print("Match %:",result.match_percentage)
+    print("Match %:",result.word_match_percentage)
     print("FULL RESULT:\n",result)
     print("=====================================================")
 
@@ -1380,12 +1481,21 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
 # IVR TEST JSON PARSER
 ################################################
   
-def json_file_parse(json_file):
+def json_parse(session):
+    data = json.loads(session["dialed_parameters_snapshot"])
+    if data:
+        logger.info(f"JSON data loaded: {data}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        
+    return IVRTestCase(data)
+
+def json_file_parse(session,json_file='ivr_test.json'):
 
     with open(json_file, "r") as f:
-
         data = json.load(f)
 
+    if data:
+        logger.info(f"JSON data loaded: {data}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+ 
     return IVRTestCase(data)
 
 def get_pjsip_call_id(channel_id):

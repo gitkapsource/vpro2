@@ -617,6 +617,70 @@ def _find_right_boundary(units: list, current_i: int, remaining: str) -> int | N
     return None
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Word-based match scorer
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _truncate_template_for_word_score(template: str) -> str:
+    """
+    For word scoring, keep only the template text that is actually expected
+    to be heard. {BargeIn} drops everything after it. {BypassRecognition}
+    is handled separately by validate().
+    """
+    kept_parts = []
+    for kind, value in _tokenise(template):
+        if kind == "tag" and _is_bargein_tag(value):
+            break
+        kept_parts.append("{" + value + "}" if kind == "tag" else value)
+    return "".join(kept_parts)
+
+
+def _normalise_words_for_score(text: str) -> list[str]:
+    """
+    Convert text to comparable words for word-match percentage.
+    Tags are removed because tags such as {*}, {Currency}, and {BargeIn}
+    are not literal spoken words.
+    """
+    text = re.sub(r"\{[^}]+\}", " ", text)
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return text.split()
+
+
+def _word_match_percentage(expect_to_hear: str, actual: str) -> float:
+    """
+    Return percentage of literal expected words matched by the actual text.
+
+    This uses longest-common-subsequence word matching, so one wrong/missing
+    word does not cause all following correct words to be missed. Existing
+    unit/tag scoring remains unchanged.
+    """
+    expected_words = _normalise_words_for_score(
+        _truncate_template_for_word_score(expect_to_hear)
+    )
+    actual_words = _normalise_words_for_score(actual)
+
+    if not expected_words:
+        return 100.0
+    if not actual_words:
+        return 0.0
+
+    # LCS with two rolling rows to keep memory low.
+    prev = [0] * (len(actual_words) + 1)
+    for expected_word in expected_words:
+        curr = [0]
+        for j, actual_word in enumerate(actual_words, 1):
+            if expected_word == actual_word:
+                curr.append(prev[j - 1] + 1)
+            else:
+                curr.append(max(prev[j], curr[-1]))
+        prev = curr
+
+    matched = prev[-1]
+    return round((matched / len(expected_words)) * 100, 1)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Public result type
 # ──────────────────────────────────────────────────────────────────────────────
@@ -624,8 +688,9 @@ def _find_right_boundary(units: list, current_i: int, remaining: str) -> int | N
 @dataclass
 class MatchResult:
     matched: bool                    # True only when full regex anchor passes (100%)
-    match_percentage: float          # 0.0–100.0
-    pattern_used: str                # anchored regex (for debugging)
+    match_percentage: float          # existing unit/tag-based score, 0.0–100.0
+    word_match_percentage: float = 0.0  # literal word-based score, 0.0–100.0
+    pattern_used: str = ""           # anchored regex (for debugging)
     detail: str = ""
     breakdown: list = field(default_factory=list)
     captured_variables: dict = field(default_factory=dict)
@@ -643,12 +708,15 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
 
     Returns MatchResult with:
       .matched              True if 100% full-regex match
-      .match_percentage     0.0–100.0 partial credit
-      .breakdown            [(label, matched, matched_text), ...]
+      .match_percentage          0.0–100.0 unit/tag-based partial credit
+      .word_match_percentage     0.0–100.0 literal word-based partial credit
+      .breakdown                 [(label, matched, matched_text), ...]
       .captured_variables   {varname: value} from Choice tags with variables
       .pattern_used         full regex string
       .detail               human-readable summary
     """
+    word_pct = _word_match_percentage(expect_to_hear, actual)
+
     # ── BypassRecognition short-circuit ───────────────────────────────────────
     # If the first meaningful tag is {BypassRecognition}, return 100% immediately.
     bypass_re = re.compile(r"\{BypassRecognition\}", re.IGNORECASE)
@@ -657,6 +725,7 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
         return MatchResult(
             matched=True,
             match_percentage=100.0,
+            word_match_percentage=100.0,
             pattern_used="<BypassRecognition>",
             detail="BypassRecognition tag present — automatic 100% match",
             breakdown=bd,
@@ -670,6 +739,7 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
         full_match = bool(re.match(pattern, actual.strip(), re.DOTALL | re.IGNORECASE))
     except re.error as exc:
         return MatchResult(matched=False, match_percentage=0.0,
+                           word_match_percentage=word_pct,
                            pattern_used=pattern, detail=f"Regex error: {exc}")
 
     # Run partial scorer in all cases (gives us breakdown + captured variables)
@@ -680,6 +750,7 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
         bd = [(label, True, text) for label, _, text in breakdown]
         return MatchResult(
             matched=True, match_percentage=100.0,
+            word_match_percentage=word_pct,
             pattern_used=pattern, detail="Full match (100%)",
             breakdown=bd, captured_variables=captured,
         )
@@ -691,10 +762,33 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
         f"Unmatched: {failed}"
         if failed else f"Partial match {pct}%"
     )
+
+    # return MatchResult(
+    #     matched=False, match_percentage=pct,
+    #     word_match_percentage=word_pct,
+    #     pattern_used=pattern, detail=detail,
+    #     breakdown=breakdown, captured_variables=captured,
+    # )
+
+    WORD_MATCH_PASS_THRESHOLD = 50.0
+
+    word_matched = word_pct >= WORD_MATCH_PASS_THRESHOLD
+    final_matched = word_matched
+
+    if word_matched:
+        detail = (
+            f"Word match passed {word_pct}% >= {WORD_MATCH_PASS_THRESHOLD}%. "
+            f"Unit match was {pct}%."
+        )
+
     return MatchResult(
-        matched=False, match_percentage=pct,
-        pattern_used=pattern, detail=detail,
-        breakdown=breakdown, captured_variables=captured,
+        matched=final_matched,
+        match_percentage=pct,
+        word_match_percentage=word_pct,
+        pattern_used=pattern,
+        detail=detail,
+        breakdown=breakdown,
+        captured_variables=captured,
     )
 
 
@@ -711,6 +805,7 @@ def print_result(result: MatchResult, eth: str = "", actual: str = ""):
     print(f"  Actual    : {actual}")
     print(f"  Match     : [{bar}] {result.match_percentage:.1f}%  "
           f"{'✓ FULL MATCH' if result.matched else '✗ PARTIAL/NO MATCH'}")
+    print(f"  Word Match: {result.word_match_percentage:.1f}%")
     if result.captured_variables:
         print(f"  Captured  : {result.captured_variables}")
     if result.breakdown:
