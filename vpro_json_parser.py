@@ -40,6 +40,7 @@ class Meta:
     phone_to_dial: str
     execution_mode: int
     compiled_at: str
+    # leaf_node_id: int
 
 @dataclass
 class TestModelSettings:
@@ -85,6 +86,9 @@ class IVRTestCase:
         self.nodes = {}
 
         for node_id, node_data in json_data["dial_plan"].items():
+
+            if node_data.get("node_type") == "Start Point":
+                continue
 
             action = None
 

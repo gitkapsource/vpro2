@@ -59,6 +59,9 @@ logger.addHandler(
 )
 
 ###########################################################
+NODE_TEST_FAILED = 0
+NODE_TEST_SATISFACTORY = 1
+NODE_TEST_SUCCESS = 2
 
 SILENCE_THRESHOLD = 300
 
@@ -170,7 +173,7 @@ def rtp_receiver():
             if session["bot_rtp_start_time"] > 0:
                 print("\n",session["voicebot_channel"],":Bot RTP Start Time was:", session["bot_rtp_start_time"],"Current Time is:",time.monotonic())
                 session["bot_last_rtp_time"] = time.monotonic()
-                current_latency = time.monotonic() - session["bot_rtp_start_time"]
+                current_latency = round(time.monotonic() - session["bot_rtp_start_time"],2)
 
                 # if session["bot_avg_latency"] > 0:
                 #     session["bot_avg_latency"] = (session["bot_avg_latency"] + current_latency)/2
@@ -187,7 +190,7 @@ def rtp_receiver():
 
         if ws:
             try:
-                print("Sending payload to ws: ", ws)
+                # print("Sending payload to ws: ", ws)
                 ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
             except:
                 pass
@@ -360,6 +363,33 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         if (result.captured_variables and any(result.captured_variables.values())):
             session["captured_variables"].update(result.captured_variables)
 
+        # Calculate Node Test Result
+        # Calculate Node Test Response Result
+
+        latency = float(session["bot_avg_latency"])
+
+        if latency < current_node.minor_threshold_time:
+            node_test_response_time = NODE_TEST_SUCCESS
+        elif latency <= current_node.major_threshold_time:
+            node_test_response_time = NODE_TEST_SATISFACTORY
+        else:
+            node_test_response_time = NODE_TEST_FAILED
+
+        # Calculate Node Test Match Result
+
+        confidence = float(result.word_match_percentage)
+
+        if confidence < current_node.minor_confidence_level:
+            node_test_match_percentage = NODE_TEST_FAILED
+        elif confidence <= current_node.major_confidence_level:
+            node_test_match_percentage = NODE_TEST_SATISFACTORY
+        else:
+            node_test_match_percentage = NODE_TEST_SUCCESS
+
+        node_test_result = min(node_test_response_time, node_test_match_percentage)
+
+        logger.info(f"Node Test Response Result: {latency}|{node_test_response_time}, Node Test Match Result: {confidence}|{node_test_match_percentage}, Node Test Final Result: {node_test_result} ", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
         session["node_result"] = {
             "node_id": session["current_node_id"],
             "expected_text": session["expected_text"],
@@ -367,7 +397,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             "transcription_match": result.word_match_percentage,#result.match_percentage,
             "response_time": session["bot_avg_latency"],
             "test_result": json.dumps(asdict(result),ensure_ascii=False),
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ") #"2026-06-22T18:21:55Z" 
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), #"2026-06-22T18:21:55Z"
+            "node_test_result": node_test_result 
         }
 
         # Insert Test History Data into the DB
@@ -988,16 +1019,10 @@ def on_ari(ws, message):
         session = call_sessions[channel_id]
         logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":sip_call_id,"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
-
-
-
         # create stt_ws socket
         stt_ws = start_stt(channel_id)
         session["stt_ws"] = stt_ws
         logger.info(f"stt_ws created: {session['stt_ws']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-
-
-
 
         # Fetch the Test Data
         fetch_test_history(session)
