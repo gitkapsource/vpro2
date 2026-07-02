@@ -927,7 +927,11 @@ def on_ari(ws, message):
             return
 
         # Clean-up Channel objects and data
-        cleanup_call(session)
+        threading.Thread(
+            target=cleanup_call,
+            args=(session,),
+            daemon=True
+        ).start()
         return
     
     # If this event is from the Voicebot Channel then extract the Caller Channel
@@ -949,6 +953,16 @@ def on_ari(ws, message):
     if event["type"] != "StasisStart":
         return
     
+    # Moving the rest of the Stasis Start logic to a thread
+
+    threading.Thread(
+        target=handle_stasis_start,
+        args=(event,channel_id, channel_name, parent_channel),
+        daemon=True
+    ).start()
+    return
+
+def handle_stasis_start(event, channel_id, channel_name, parent_channel):
     #  # Extension that was dialed
     context = event["channel"]["dialplan"]["context"]
     exten = event["channel"]["dialplan"]["exten"]
@@ -1096,6 +1110,7 @@ def on_ari(ws, message):
         #record_channel(channel_id)
 
         add_channel_to_bridge(session["bridge_id"], channel_id)
+
 
 ################################################
 # LOAD THE TEST CASE FROM THE IVR TEST JSON
