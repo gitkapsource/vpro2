@@ -78,7 +78,23 @@ _ORD_W   = (
     r"|twenty[-\s]ninth|thirtieth|thirty[-\s]first)"
 )
 _ORD  = rf"(?:\d{{1,2}}(?:st|nd|rd|th)?|{_ORD_W})"
-_YEAR = r"(?:\d{4}|(?:nineteen|twenty)\s+\w+(?:\s+\w+)?)"
+# _YEAR = r"(?:\d{4}|(?:nineteen|twenty)\s+\w+(?:\s+\w+)?)"
+
+_YEAR_UNIT = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine"
+    r"|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen"
+    r"|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy"
+    r"|eighty|ninety)"
+)
+
+_YEAR = (
+    r"(?:"
+    r"\d{4}"
+    rf"|(?:nineteen|twenty)\s+{_YEAR_UNIT}(?:\s+{_YEAR_UNIT})?"
+    rf"|two\s+thousand(?:\s+and)?(?:\s+{_YEAR_UNIT}){{0,2}}"
+    rf"|twenty\s+twenty(?:\s+{_YEAR_UNIT})?"
+    r")"
+)
 
 _DATE = "(?:" + "|".join([
     rf"(?:{_WEEKDAY}\s+)?(?:the\s+)?{_ORD}\s+of\s+{_MONTH}(?:\s+{_YEAR})?",
@@ -89,12 +105,14 @@ _DATE = "(?:" + "|".join([
     _MONTH,
     rf"{_WEEKDAY}(?:\s+the\s+{_ORD})?",
     r"\d{1,2}\s+\d{1,2}",
+    _YEAR,
 ]) + ")"
 
 _TIME = "(?:" + "|".join([
     r"(?:noon|midnight|midday)",
     r"(?:before|after)\s+\w+(?:\s+\w+)?",
     r"\d{1,2}:\d{2}\s*(?:am|pm)?",
+    r"\d{1,2}\s*(?:am|pm)",
     r"(?:half\s+past|quarter\s+(?:past|to))\s+\w+",
     r"\d{1,2}\s+hundred\s+hours?",
     r"twenty[-\s]four\s+hundred(?:\s+hours?)?",
@@ -118,6 +136,7 @@ CURRENCY_PATTERNS: dict = {
     "en-US": [
         rf"{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*\s+(?:u\.?s\.?\s+)?dollars?\s+and\s+{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*\s+cents?",
         rf"{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*\s+dollars?\s+{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*\s+cents?",
+        rf"{_NUMBER}\s+(?:u\.?s\.?\s+)?dollars?",   # add this
     ],
     "es-US": [
         r"(?:\w+)(?:\s+\w+)*\s+(?:pesos?|d(?:o|ó)lares?)\s+y\s+(?:\w+)(?:\s+\w+)*\s+centavos?",
@@ -126,15 +145,25 @@ CURRENCY_PATTERNS: dict = {
         r"(?:\w+)(?:\s+\w+)*\s+euro\s+en\s+(?:\w+)(?:\s+\w+)*\s+cent",
     ],
 }
+
+# _CURRENCY_GENERIC = (
+#     r"(?:"
+#     rf"{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*"
+#     r"\s+(?:dollars?|euros?|pounds?|pesos?|yen|francs?|rupees?|kroner?)"
+#     r"(?:\s+and\s+\w+(?:\s+\w+)*\s+(?:cents?|pence|penny|centavos?|centimes?))?"
+#     rf"|{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*"   # bare amount (backtrack target)
+#     r")"
+# )
+
 _CURRENCY_GENERIC = (
     r"(?:"
-    rf"{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*"
-    r"\s+(?:dollars?|euros?|pounds?|pesos?|yen|francs?|rupees?|kroner?)"
-    r"(?:\s+and\s+\w+(?:\s+\w+)*\s+(?:cents?|pence|penny|centavos?|centimes?))?"
-    rf"|{_NUM_W_OR_D}(?:\s+{_NUM_WORD})*"   # bare amount (backtrack target)
+    rf"{_NUMBER}\s+(?:dollars?|euros?|pounds?|pesos?|yen|francs?|rupees?|kroner?)"
+    r"(?:\s+and\s+"
+    rf"{_NUMBER}\s+(?:cents?|pence|penny|centavos?|centimes?))?"
+    r"|"
+    rf"{_NUMBER}"
     r")"
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Exact-count helpers for Digits and AlphaNum
@@ -258,14 +287,18 @@ def _tag_to_regex(tag: str, language: str) -> str:
     if m:
         lo = int(m.group(1)) if m.group(1) else 1
         hi = int(m.group(2)) if m.group(2) else (lo if m.group(1) else 20)
-        # Full-regex fragment — boundary is enforced by exact-count in partial scorer
-        return rf"(?:{_DIGIT_TOKEN}(?:\s+{_DIGIT_TOKEN}){{{lo - 1},{hi - 1}}})"
+        # Accept both spoken-separated digits (1 2 3 4) and compact digit
+        # strings (1234). Exact overlength is enforced by the anchored regex
+        # here and by the partial scorer.
+        return rf"(?:(?:\d{{{lo},{hi}}})|(?:{_DIGIT_TOKEN}(?:\s+{_DIGIT_TOKEN}){{{lo - 1},{hi - 1}}}))"
 
     m = re.match(r"ALPHANUM(?:\s+LENGTH=(\d+)(?:-(\d+))?)?(?:\s+\$\w+.*)?$", tu)
     if m:
         lo = int(m.group(1)) if m.group(1) else 1
         hi = int(m.group(2)) if m.group(2) else (lo if m.group(1) else 20)
-        return rf"(?:[A-Za-z0-9](?:\s*[A-Za-z0-9]){{{lo - 1},{hi - 1}}})"
+        # Accept both compact IDs (ABC123) and spoken-separated IDs
+        # (A B C 1 2 3).
+        return rf"(?:(?:[A-Za-z0-9]{{{lo},{hi}}})|(?:[A-Za-z0-9](?:\s+[A-Za-z0-9]){{{lo - 1},{hi - 1}}}))"
 
     m = re.match(r"OPTIONAL\s+(.+)$", t, re.IGNORECASE)
     if m:
@@ -323,7 +356,58 @@ def build_regex(template: str, language: str = "en-US") -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _is_scoreable_literal(text: str) -> bool:
-    return bool(re.search(r"[A-Za-z0-9]", text))
+    return bool(re.search(r"\w", text, re.UNICODE))
+
+
+_WORD_STRIP_CHARS = " \t\r\n.,;:!?()[]{}<>\\/\"'“”‘’`~@#$%^&*-_=+|"
+
+def _word_tokens(text: str) -> list[str]:
+    """
+    Whitespace tokenizer that preserves non-English words such as Hindi.
+    We strip common punctuation from token edges but do not use \\w for token
+    extraction, because Python's \\w can split Indic words at vowel signs.
+    """
+    words = []
+    for raw in text.split():
+        tok = raw.strip(_WORD_STRIP_CHARS)
+        if tok:
+            words.append(tok)
+    return words
+
+
+def _literal_words(text: str) -> list[str]:
+    """
+    Split a literal template span into individual words.
+
+    This is intentionally word-level. A literal span like
+    "you have selected account information" must not be scored as one
+    all-or-nothing unit.
+    """
+    return _word_tokens(text)
+
+
+def _word_regex(word: str) -> re.Pattern:
+    """
+    Regex for a single literal word with Unicode-aware non-word boundaries.
+    This avoids matching "one" inside "someone".
+    """
+    return re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE | re.UNICODE)
+
+
+def _count_words(text: str) -> int:
+    """Count actual words, including non-English words such as Hindi."""
+    return len(_word_tokens(text))
+
+
+def _add_unexpected_extra(breakdown: list, skipped_text: str) -> int:
+    """
+    Add penalty units for words skipped before the next expected unit.
+    Returns how many extra-word penalty units were added.
+    """
+    words = _word_tokens(skipped_text)
+    for word in words:
+        breakdown.append((f'extra "{word}"', False, word))
+    return len(words)
 
 
 def _extract_scored_units(template: str, language: str) -> list:
@@ -344,14 +428,17 @@ def _extract_scored_units(template: str, language: str) -> list:
         if kind == "literal":
             if not _is_scoreable_literal(value):
                 continue
-            frag = _literal_to_regex(value.strip())
-            units.append({
-                "label":    f'literal "{value.strip()}"',
-                "regex":    re.compile(frag, re.IGNORECASE),
-                "optional": False,
-                "kind":     "literal",
-                "tag_type": None,
-            })
+
+            # Score literal text at word level, not as one all-or-nothing span.
+            for word in _literal_words(value):
+                units.append({
+                    "label":    f'literal "{word}"',
+                    "regex":    _word_regex(word),
+                    "optional": False,
+                    "kind":     "literal",
+                    "tag_type": "LITERAL_WORD",
+                    "word":     word,
+                })
             continue
 
         # ── tag ───────────────────────────────────────────────────────────────
@@ -457,137 +544,393 @@ def _extract_scored_units(template: str, language: str) -> list:
 # Partial match scorer  (with wildcard anchoring + exact-count enforcement)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+def _actual_token_spans(text: str) -> list[tuple[str, int, int]]:
+    """
+    Return comparable actual tokens with their character spans in the original text.
+    This preserves Hindi / non-English words by splitting on whitespace and
+    trimming only edge punctuation.
+    """
+    spans = []
+    for m in re.finditer(r"\S+", text):
+        raw = m.group(0)
+        left = 0
+        right = len(raw)
+        while left < right and raw[left] in _WORD_STRIP_CHARS:
+            left += 1
+        while right > left and raw[right - 1] in _WORD_STRIP_CHARS:
+            right -= 1
+        if left < right:
+            spans.append((raw[left:right], m.start() + left, m.start() + right))
+    return spans
+
+
+def _token_text_from_span(actual: str, spans: list[tuple[str, int, int]], start_idx: int, end_idx: int) -> str:
+    if start_idx >= end_idx or start_idx >= len(spans):
+        return ""
+    return actual[spans[start_idx][1]:spans[end_idx - 1][2]]
+
+
+def _char_end_to_token_index(spans: list[tuple[str, int, int]], start_idx: int, char_end: int) -> int:
+    """Return the first token index after char_end."""
+    k = start_idx
+    while k < len(spans) and spans[k][1] < char_end:
+        k += 1
+    return k
+
+
+def _expanded_token_len(token: str, tag_type: str, token_re: re.Pattern) -> int | None:
+    """
+    Length contribution for exact-count tags.
+    DIGITS: 123456 counts as six digits; one/two/etc count as one.
+    ALPHANUM: ABC123 counts as six alphanumeric symbols; A/B/1 count as one.
+    """
+    stripped = token.strip(_WORD_STRIP_CHARS)
+    if tag_type == "DIGITS":
+        if stripped.isdigit():
+            return len(stripped)
+        return 1 if token_re.match(stripped) else None
+    if tag_type == "ALPHANUM":
+        # Treat compact IDs like ABC123 / A1B2 and spoken characters like
+        # A B C 1 2 3 as alphanumeric units, but do not let ordinary words
+        # such as "is" or "code" satisfy {AlphaNum}.
+        if re.fullmatch(r"[A-Za-z0-9]+", stripped):
+            if len(stripped) == 1 or any(ch.isdigit() for ch in stripped) or stripped.isupper():
+                return len(stripped)
+        return None
+    return None
+
+
+
+def _invalid_exact_token_run_at(unit: dict, spans: list[tuple[str, int, int]], j: int) -> tuple[int, str] | None:
+    """
+    If an exact-count tag is facing a same-type run with the wrong length,
+    consume that whole run as a single failed tag unit. This prevents the
+    aligner from turning a bad PIN/code into many unrelated extras or from
+    matching a suffix of the run.
+    """
+    if j >= len(spans):
+        return None
+    tag_type = unit["tag_type"]
+    token_re = _DIGIT_TOKEN_RE if tag_type == "DIGITS" else _ALPHANUM_TOKEN_RE
+    k = j
+    count = 0
+    while k < len(spans):
+        n = _expanded_token_len(spans[k][0], tag_type, token_re)
+        if n is None:
+            break
+        count += n
+        k += 1
+    if k > j and not (unit["lo"] <= count <= unit["hi"]):
+        return k, _token_text_from_span(_CURRENT_ACTUAL_TEXT, spans, j, k)
+    return None
+
+def _match_exact_token_unit_at(unit: dict, spans: list[tuple[str, int, int]], j: int) -> tuple[int, str] | None:
+    tag_type = unit["tag_type"]
+    lo, hi = unit["lo"], unit["hi"]
+    token_re = _DIGIT_TOKEN_RE if tag_type == "DIGITS" else _ALPHANUM_TOKEN_RE
+
+    k = j
+    count = 0
+    while k < len(spans):
+        n = _expanded_token_len(spans[k][0], tag_type, token_re)
+        if n is None:
+            break
+        count += n
+        k += 1
+
+    if lo <= count <= hi:
+        return k, _token_text_from_span(_CURRENT_ACTUAL_TEXT, spans, j, k)
+
+    # Do not match a suffix of an overlong run. The entire run fails.
+    return None
+
+
+def _match_regex_unit_at(unit: dict, actual: str, spans: list[tuple[str, int, int]], j: int) -> tuple[int, str] | None:
+    if j >= len(spans):
+        return None
+    regex = unit.get("regex")
+    if regex is None:
+        return None
+
+    start_char = spans[j][1]
+    remaining = actual[start_char:]
+    m = regex.match(remaining)
+    if not m:
+        return None
+
+    text = m.group(0).strip()
+    if not text:
+        return j, ""
+
+    end_char = start_char + m.end()
+    next_j = _char_end_to_token_index(spans, j, end_char)
+    if next_j == j:
+        next_j = j + 1
+    return next_j, actual[start_char:end_char].strip()
+
+
+def _match_choice_unit_at(unit: dict, actual: str, spans: list[tuple[str, int, int]], j: int) -> tuple[int, str, str | None] | None:
+    varname, alts = unit["choice_meta"]
+
+    # Empty alternative.
+    for phrase, value in alts:
+        if phrase == ".":
+            return j, "", value
+
+    if j >= len(spans):
+        return None
+
+    start_char = spans[j][1]
+    remaining = actual[start_char:]
+    best = None
+    for phrase, value in alts:
+        pat = re.compile(_literal_to_regex(phrase), re.IGNORECASE | re.UNICODE)
+        m = pat.match(remaining)
+        if m:
+            text = m.group(0)
+            end_char = start_char + m.end()
+            next_j = _char_end_to_token_index(spans, j, end_char)
+            cand = (next_j, text.strip(), value)
+            if best is None or len(cand[1]) > len(best[1]):
+                best = cand
+    return best
+
+
 def _score_partial(units: list, actual: str) -> tuple:
     """
-    Left-to-right ordered scan.
+    Sequence-alignment scorer.
 
-    Returns (matched_count, total_units, breakdown, captured_variables).
-    breakdown  : list of (label, matched:bool, matched_text:str|None)
-    captured_variables : dict of {varname: value} from Choice tags
+    The old scorer was greedy and literal-span based. This version treats every
+    literal word as a unit, aligns expected units to actual tokens, and classifies
+    mismatches as substitutions, insertions/extras, or missing units.
+
+    Scoring rules:
+      - literal word match: +1 matched / +1 total
+      - required tag match: +1 matched / +1 total
+      - substitution: +0 matched / +1 total
+      - missing expected unit: +0 matched / +1 total
+      - unexpected extra actual word: +0 matched / +1 total
+      - wildcard-consumed text: no score impact
     """
-    remaining  = actual.strip()
-    breakdown  = []
-    total      = 0
-    matched    = 0
-    captured   = {}
-    i          = 0
+    global _CURRENT_ACTUAL_TEXT
+    _CURRENT_ACTUAL_TEXT = actual
+    spans = _actual_token_spans(actual)
+    n_units = len(units)
+    n_tokens = len(spans)
+    memo = {}
 
-    while i < len(units):
-        unit     = units[i]
-        label    = unit["label"]
+    def score_key(res):
+        matched, total, breakdown, captured = res
+        pct = matched / total if total else 1.0
+        # Prefer higher percentage, then more matched units, then fewer total penalties.
+        return (pct, matched, -total)
+
+    def merge_captured(a, b):
+        if not b:
+            return a
+        out = dict(a)
+        out.update(b)
+        return out
+
+    def dp(i: int, j: int):
+        key = (i, j)
+        if key in memo:
+            return memo[key]
+
+        # No more expected units: remaining actual words are unexpected extras.
+        if i >= n_units:
+            breakdown = []
+            total = 0
+            for k in range(j, n_tokens):
+                word = spans[k][0]
+                breakdown.append((f'extra "{word}"', False, word))
+                total += 1
+            res = (0, total, breakdown, {})
+            memo[key] = res
+            return res
+
+        unit = units[i]
+        label = unit["label"]
         optional = unit["optional"]
         tag_type = unit.get("tag_type")
 
-        # ── BypassRecognition ──────────────────────────────────────────────────
+        # Control tags end the scored contract.
         if tag_type == "BYPASS":
-            breakdown.append((label, True, None))
-            i += 1
-            break
+            res = (0, 0, [(label, True, None)], {})
+            memo[key] = res
+            return res
 
-        # ── BargeIn: marker only — preceding units already scored normally;
-        #             nothing after this point was ever part of the contract ──
         if tag_type == "BARGEIN":
-            breakdown.append((label, True, None))
-            i += 1
-            break
+            res = (0, 0, [(label, True, None)], {})
+            memo[key] = res
+            return res
 
-        # ── Wildcard: advance remaining to where the next unit starts ──────────
+        candidates = []
+
+        # Wildcard can consume any number of actual tokens with no penalty.
         if tag_type == "WILDCARD":
-            next_start = None
-            for j in range(i + 1, len(units)):
-                nu = units[j]
-                if nu.get("tag_type") == "WILDCARD":
-                    continue
-                # Peek ahead using the next unit's matching logic
-                test_match = _try_match_unit(nu, remaining)
-                if test_match is not None:
-                    # find its start position
-                    if nu.get("tag_type") in ("DIGITS", "ALPHANUM"):
-                        next_start = 0  # exact-count always starts from 0
-                    else:
-                        m = nu["regex"].search(remaining)
-                        if m:
-                            next_start = m.start()
-                    break
-            consumed  = remaining if next_start is None else remaining[:next_start]
-            remaining = "" if next_start is None else remaining[next_start:]
-            breakdown.append((label, True, consumed.strip() or None))
-            i += 1
-            continue
+            for k in range(j, n_tokens + 1):
+                tail = dp(i + 1, k)
+                consumed = _token_text_from_span(actual, spans, j, k).strip() or None
+                candidates.append((
+                    tail[0],
+                    tail[1],
+                    [(label, True, consumed)] + tail[2],
+                    tail[3],
+                ))
+            best = max(candidates, key=score_key)
+            memo[key] = best
+            return best
 
-        # ── Exact-count: Digits / AlphaNum ────────────────────────────────────
-        if tag_type in ("DIGITS", "ALPHANUM"):
-            if not optional:
-                total += 1
-            lo, hi   = unit["lo"], unit["hi"]
-            tok_re   = _DIGIT_TOKEN_RE if tag_type == "DIGITS" else _ALPHANUM_TOKEN_RE
-            # Find right boundary from next literal unit
-            right_boundary = _find_right_boundary(units, i, remaining)
-            search_in = remaining if right_boundary is None else remaining[:right_boundary]
-            result = _match_exact_tokens(search_in, lo, hi, tok_re)
-            if result is not None:
-                matched += 1
-                breakdown.append((label, True, result))
-                remaining = remaining[len(result):].lstrip()
-            else:
-                breakdown.append((label, False, None))
-            i += 1
-            continue
+        # Optional non-wildcard unit can be skipped without penalty.
+        if optional:
+            tail = dp(i + 1, j)
+            candidates.append((tail[0], tail[1], [(label, True, None)] + tail[2], tail[3]))
 
-        # ── Choice: match and capture variable ────────────────────────────────
-        if tag_type == "CHOICE":
-            if not optional:
-                total += 1
-            varname, alts = unit["choice_meta"]
-            right_boundary = _find_right_boundary(units, i, remaining)
-            search_in = remaining if right_boundary is None else remaining[:right_boundary + 50]
-            match_result = None
-            matched_value = None
-            for phrase, value in alts:
-                if phrase == ".":
-                    # matches empty — counts as found
-                    match_result = ""
-                    matched_value = value
-                    break
-                pat = re.compile(_literal_to_regex(phrase), re.IGNORECASE)
-                m = pat.search(search_in)
-                if m:
-                    match_result = m.group(0)
-                    matched_value = value
-                    remaining = remaining[remaining.index(match_result) + len(match_result):]
-                    break
-            if match_result is not None:
-                matched += 1
-                if varname:
-                    captured[varname] = matched_value
-                breakdown.append((label, True, match_result or None))
-            else:
-                breakdown.append((label, False, None))
-            i += 1
-            continue
+        # If actual token exists, allow insertion/extra before this expected unit.
+        # For exact-count tags, do not allow skipping the first token of a
+        # same-type run to make an overlong run match by suffix. Example:
+        # {Digits Length=4} must fail on "1 2 3 4 5" instead of treating
+        # "1" as extra and matching "2 3 4 5".
+        if j < n_tokens:
+            current_is_same_type = False
+            if tag_type in ("DIGITS", "ALPHANUM"):
+                tok_re = _DIGIT_TOKEN_RE if tag_type == "DIGITS" else _ALPHANUM_TOKEN_RE
+                current_is_same_type = _expanded_token_len(spans[j][0], tag_type, tok_re) is not None
 
-        # ── All other tags and literals ────────────────────────────────────────
+            if not current_is_same_type:
+                word = spans[j][0]
+                tail = dp(i, j + 1)
+                candidates.append((
+                    tail[0],
+                    tail[1] + 1,
+                    [(f'extra "{word}"', False, word)] + tail[2],
+                    tail[3],
+                ))
+
+        # Required unit can be missing/deleted.
         if not optional:
-            total += 1
+            tail = dp(i + 1, j)
+            candidates.append((
+                tail[0],
+                tail[1] + 1,
+                [(label, False, None)] + tail[2],
+                tail[3],
+            ))
 
-        right_boundary = _find_right_boundary(units, i, remaining)
-        m = unit["regex"].search(remaining)
+        # Literal word: match or substitute one actual token.
+        if tag_type == "LITERAL_WORD":
+            if j < n_tokens:
+                actual_word = spans[j][0]
+                expected_word = unit["word"]
+                tail = dp(i + 1, j + 1)
+                if actual_word.lower() == expected_word.lower():
+                    candidates.append((
+                        tail[0] + 1,
+                        tail[1] + 1,
+                        [(label, True, actual_word)] + tail[2],
+                        tail[3],
+                    ))
+                else:
+                    candidates.append((
+                        tail[0],
+                        tail[1] + 1,
+                        [(f'substitution "{expected_word}" -> "{actual_word}"', False, actual_word)] + tail[2],
+                        tail[3],
+                    ))
 
-        if m:
-            # Respect right boundary to prevent consuming upcoming literal text
-            if right_boundary is not None and m.end() > right_boundary:
-                bounded_m = unit["regex"].search(remaining[:right_boundary])
-                if bounded_m:
-                    m = bounded_m
-            matched += (0 if optional else 1)
-            breakdown.append((label, True, m.group(0).strip()))
-            remaining = remaining[m.end():]
+        # Exact-count tags.
+        elif tag_type in ("DIGITS", "ALPHANUM"):
+            m = _match_exact_token_unit_at(unit, spans, j)
+            if m is not None:
+                next_j, text = m
+                tail = dp(i + 1, next_j)
+                candidates.append((
+                    tail[0] + (0 if optional else 1),
+                    tail[1] + (0 if optional else 1),
+                    [(label, True, text)] + tail[2],
+                    tail[3],
+                ))
+            else:
+                bad_run = _invalid_exact_token_run_at(unit, spans, j)
+                if bad_run is not None and not optional:
+                    next_j, text = bad_run
+                    tail = dp(i + 1, next_j)
+                    candidates.append((
+                        tail[0],
+                        tail[1] + 1,
+                        [(label, False, text)] + tail[2],
+                        tail[3],
+                    ))
+
+        # Choice tag with optional variable capture.
+        elif tag_type == "CHOICE":
+            m = _match_choice_unit_at(unit, actual, spans, j)
+            if m is not None:
+                next_j, text, value = m
+                tail = dp(i + 1, next_j)
+                captured = dict(tail[3])
+                varname, _ = unit["choice_meta"]
+                if varname:
+                    captured[varname] = value
+                candidates.append((
+                    tail[0] + 1,
+                    tail[1] + 1,
+                    [(label, True, text or None)] + tail[2],
+                    captured,
+                ))
+
+        # Regex-backed tags: Date, Time, Number, Currency, etc.
         else:
-            breakdown.append((label, False, None))
+            m = _match_regex_unit_at(unit, actual, spans, j)
+            if m is not None:
+                next_j, text = m
+                tail = dp(i + 1, next_j)
+                candidates.append((
+                    tail[0] + (0 if optional else 1),
+                    tail[1] + (0 if optional else 1),
+                    [(label, True, text)] + tail[2],
+                    tail[3],
+                ))
 
-        i += 1
+        best = max(candidates, key=score_key)
+        memo[key] = best
+        return best
 
-    return matched, total, breakdown, captured
+    return dp(0, 0)
+
+def _find_exact_token_match(text: str, lo: int, hi: int, token_re: re.Pattern) -> tuple[int, str] | None:
+    """
+    Find a same-type token run of length lo..hi anywhere in text.
+    Returns (start_char_position, matched_text) or None.
+
+    Important: a run longer than hi is not partially matched. For example,
+    {Digits Length=4} must fail on "1 2 3 4 5" rather than matching
+    "2 3 4 5" and treating "1" as an extra word.
+    """
+    matches = list(re.finditer(r"\S+", text))
+    idx = 0
+
+    while idx < len(matches):
+        if not token_re.match(matches[idx].group(0)):
+            idx += 1
+            continue
+
+        start_idx = idx
+        while idx < len(matches) and token_re.match(matches[idx].group(0)):
+            idx += 1
+
+        run_len = idx - start_idx
+        if lo <= run_len <= hi:
+            start = matches[start_idx].start()
+            end = matches[idx - 1].end()
+            return start, text[start:end]
+
+        # If the run is too short/too long, skip the whole run.
+        # Do not try to match a suffix of an overlong run.
+
+    return None
 
 
 def _try_match_unit(unit: dict, remaining: str):
@@ -648,37 +991,19 @@ def _normalise_words_for_score(text: str) -> list[str]:
     return text.split()
 
 
-def _word_match_percentage(expect_to_hear: str, actual: str) -> float:
+def _word_match_percentage(expect_to_hear: str, actual: str, language: str = "en-US") -> float:
     """
-    Return percentage of literal expected words matched by the actual text.
+    Return tag-aware, extra-aware word/unit score.
 
-    This uses longest-common-subsequence word matching, so one wrong/missing
-    word does not cause all following correct words to be missed. Existing
-    unit/tag scoring remains unchanged.
+    This score is based on the same left-to-right scorer as match_percentage:
+      - literal words are individual units
+      - required tags are individual units
+      - unexpected extra words are penalty units
+      - text consumed by {*} / {wildcard} is ignored
     """
-    expected_words = _normalise_words_for_score(
-        _truncate_template_for_word_score(expect_to_hear)
-    )
-    actual_words = _normalise_words_for_score(actual)
-
-    if not expected_words:
-        return 100.0
-    if not actual_words:
-        return 0.0
-
-    # LCS with two rolling rows to keep memory low.
-    prev = [0] * (len(actual_words) + 1)
-    for expected_word in expected_words:
-        curr = [0]
-        for j, actual_word in enumerate(actual_words, 1):
-            if expected_word == actual_word:
-                curr.append(prev[j - 1] + 1)
-            else:
-                curr.append(max(prev[j], curr[-1]))
-        prev = curr
-
-    matched = prev[-1]
-    return round((matched / len(expected_words)) * 100, 1)
+    units = _extract_scored_units(expect_to_hear, language)
+    matched, total, _, _ = _score_partial(units, actual)
+    return round(matched / total * 100, 1) if total else 100.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -715,7 +1040,7 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
       .pattern_used         full regex string
       .detail               human-readable summary
     """
-    word_pct = _word_match_percentage(expect_to_hear, actual)
+    word_pct = _word_match_percentage(expect_to_hear, actual, language)
 
     # ── BypassRecognition short-circuit ───────────────────────────────────────
     # If the first meaningful tag is {BypassRecognition}, return 100% immediately.
@@ -770,19 +1095,12 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
     #     breakdown=breakdown, captured_variables=captured,
     # )
 
-    WORD_MATCH_PASS_THRESHOLD = 50.0
-
-    word_matched = word_pct >= WORD_MATCH_PASS_THRESHOLD
-    final_matched = word_matched
-
-    if word_matched:
-        detail = (
-            f"Word match passed {word_pct}% >= {WORD_MATCH_PASS_THRESHOLD}%. "
-            f"Unit match was {pct}%."
-        )
-
+    # Important:
+    # .matched means the full anchored template matched.
+    # Do not mark .matched=True merely because word_match_percentage crosses
+    # an acceptance threshold; threshold decisions should be made by the caller.
     return MatchResult(
-        matched=final_matched,
+        matched=False,
         match_percentage=pct,
         word_match_percentage=word_pct,
         pattern_used=pattern,
