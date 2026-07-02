@@ -862,9 +862,9 @@ def on_ari(ws, message):
     #print("on_ari: Incoming Event:", event)
     #print("on_ari: MR KAPS Event TYPE:", event["type"])
 
-    # if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
-    #     print("This is ;2 leg, ignore")
-    #     return
+    if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
+        print("This is ;2 leg, ignore")
+        return
     
     parent_channel = None
 
@@ -974,7 +974,7 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
     if parent_channel is None:
                 
-        sip_call_id = get_pjsip_call_id(channel_id)
+        sip_call_id = channel_id #get_pjsip_call_id(channel_id)
 
         # Initiating Call Session Array
         call_sessions[channel_id] = {
