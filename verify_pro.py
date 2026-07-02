@@ -171,7 +171,8 @@ def rtp_receiver():
                 session["next_prompt_heard"] = 1
 
             if session["bot_rtp_start_time"] > 0:
-                print("\n",session["voicebot_channel"],":Bot RTP Start Time was:", session["bot_rtp_start_time"],"Current Time is:",time.monotonic())
+                logger.info(f"Bot RTP Start Time was: {session['bot_rtp_start_time']}, Current Time is: {time.monotonic()}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
                 session["bot_last_rtp_time"] = time.monotonic()
                 current_latency = round(time.monotonic() - session["bot_rtp_start_time"],2)
 
@@ -180,8 +181,7 @@ def rtp_receiver():
                 # else:
                   
                 session["bot_avg_latency"] = current_latency
-
-                print("\n",session,":Current Latency: ", current_latency ,"Bot Average Latency Recorded:", session["bot_avg_latency"])
+                logger.info(f"Current Latency: {current_latency}, Bot Average Latency Recorded: {session['bot_avg_latency']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
                 session["bot_rtp_start_time"] = 0
         # else:
         #     print("Silence packet")
@@ -195,7 +195,9 @@ def rtp_receiver():
             except:
                 pass
         else:
-            print("No stt ws available to send audio")
+            # print("No stt ws available to send audio")
+            logger.info(f"No stt ws available to send audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
 
 ################################################
 # Deepgram STT
@@ -229,7 +231,7 @@ def on_stt(ws, message, channel_id):
     data = json.loads(message)
 
     #print(time.time())
-    print("ON STT: Data Received", data)
+    # print("ON STT: Data Received", data)
 
     if "channel" not in data:
         print("ON STT: Channel not in data, returning", data)
@@ -928,7 +930,7 @@ def on_ari(ws, message):
 
         # Clean-up Channel objects and data
         threading.Thread(
-            target=cleanup_call,
+            target=handle_stasis_end,
             args=(session,),
             daemon=True
         ).start()
@@ -1391,10 +1393,10 @@ def update_test_history(session, stage=0):
         conn.close()
 
 ################################################
-# HANGUP EVENT HANDLER
+# CLEAN UP CALL STASIS END EVENT HANDLER
 ################################################
 
-def cleanup_call(session):
+def handle_stasis_end(session):
 
     bridge_id = session.get("bridge_id")
     caller = session.get("caller_channel")
