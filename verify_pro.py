@@ -245,7 +245,7 @@ def on_stt(ws, message, channel_id):
 
         session["transcript"] += " " + transcript
 
-        write_transcript(channel_id, "Caller", transcript)
+        # write_transcript(channel_id, "Caller", transcript)
 
         # Let's check the interim Transcript to match any test keywords and barge-in
         """
@@ -792,7 +792,7 @@ def create_bridge():
 
     return bridge["id"]
 
-def record_bridge(bridge_id):
+def record_bridge(session, bridge_id):
 
     r = requests.post(
         f"{ASTERISK_URL}/ari/bridges/{bridge_id}/record",
@@ -805,10 +805,30 @@ def record_bridge(bridge_id):
         }
     )
 
-    print("Bridge recording started:", bridge_id)
+    logger.info(
+        f"Bridge recording started: {bridge_id}: {r.status_code} {r.text}",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN")
+        }
+    )
 
-def record_channel(channel_id):
+# def record_channel(channel_id):
 
+#     r = requests.post(
+#         f"{ASTERISK_URL}/ari/channels/{channel_id}/record",
+#         auth=(ARI_USER, ARI_PASS),
+#         params={
+#             "name": f"rec_{channel_id}",
+#             "format": "wav",
+#             "maxDurationSeconds": 0,
+#             "ifExists": "overwrite"
+#         }
+#     )
+
+#     print("Channel recording started for the channel:", channel_id)
+
+def record_channel(session, channel_id):
     r = requests.post(
         f"{ASTERISK_URL}/ari/channels/{channel_id}/record",
         auth=(ARI_USER, ARI_PASS),
@@ -820,7 +840,15 @@ def record_channel(channel_id):
         }
     )
 
-    print("Channel recording started for the channel:", channel_id)
+    logger.info(
+        f"Channel recording start response for {channel_id}: {r.status_code} {r.text}",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN")
+        }
+    )
+
+    # return r.status_code in (200, 201)
 
 def create_external_media():
 
@@ -874,8 +902,8 @@ def dial_voicebot(channel_id, session):
 def on_ari(ws, message):
 
     event = json.loads(message)
-    print("on_ari: Incoming Event:", event)
-    #print("on_ari: MR KAPS Event TYPE:", event["type"])
+    # print("on_ari: Incoming Event:", event)
+    #print("on_ari: Event TYPE:", event["type"])
 
     if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
         print("This is ;2 leg, ignore")
@@ -884,7 +912,7 @@ def on_ari(ws, message):
     parent_channel = None
 
     if event["type"] == "PlaybackFinished":
-        # print("KAPS KAPS KAPS Event Type:", event["type"], " for Channel ID: ", event["playback"]["target_uri"].split(":")[1])
+        # print("Event Type:", event["type"], " for Channel ID: ", event["playback"]["target_uri"].split(":")[1])
         target_uri = event["playback"]["target_uri"]
         channel_id = target_uri.split(":")[1]
 
@@ -1124,10 +1152,17 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         session["voicebot_channel"] = channel_id
         session["voicebot_channel_name"] = channel_name.split(";")[0]
 
-        #record_channel(channel_id)
-
         add_channel_to_bridge(session["bridge_id"], channel_id)
 
+        #Let's start recording the call
+        
+        threading.Thread(
+        target=record_bridge,
+            args=(session, session["bridge_id"]),
+            daemon=True
+        ).start()
+
+        # record_channel(session, channel_id)
 
 ################################################
 # LOAD THE TEST CASE FROM THE IVR TEST JSON
