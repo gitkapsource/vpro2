@@ -1023,6 +1023,7 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         call_sessions[channel_id] = {
             # Call-specific
             "call_id": sip_call_id,
+            "sip_call_id": None,
             "cli": None,
             "dialed_extension": exten,
             "caller_channel": channel_id,
@@ -1137,6 +1138,8 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
     else:
         session = call_sessions[parent_channel]
         logger.info(f"Caller Channel is Available", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        session["sip_call_id"] = get_pjsip_call_id(channel_id)
 
         session["bot_connect_time"] = datetime.datetime.now()
         session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
@@ -1513,7 +1516,8 @@ def update_test_history(session, stage=0):
                     SET
                     end_time = %s,
                     call_ended_by = %s,
-                    processed = %s
+                    processed = %s,
+                    callid=%s
                     WHERE
                     id = %s
                     """
@@ -1528,6 +1532,7 @@ def update_test_history(session, stage=0):
                 session["bot_end_time"],
                 session["call_ended_by"], 
                 2, # Done
+                session["sip_call_id"],
                 session["test_execution_row_id"]
                 ))
                 
