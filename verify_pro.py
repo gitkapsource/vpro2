@@ -403,6 +403,17 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             "node_test_result": node_test_result 
         }
 
+        # Fetch on-demand RTP stats from ARI and calculate RTP-based estimated MOS.
+        # Use the actual voicebot media channel, not the ExternalMedia channel.
+        rtp_stats = get_rtp_stats(session, session.get("voicebot_channel"))
+        session["node_result"]["rtp_stats"] = rtp_stats
+        session["node_result"]["mos"] = estimate_mos_from_rtp_stats(rtp_stats)
+
+        logger.info(
+            f"RTP Stats: {rtp_stats}, Estimated MOS: {session['node_result']['mos']}",
+            extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
         # Insert Test History Data into the DB
         record_test_history(session)
 
@@ -432,7 +443,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                 logger.info(f"No Action to take: Let's Skip this Node", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
                 # Evaluate the Next Node ID
-                next_node_id = current_node.transitions.get("on_success")
+                if current_node.transitions:
+                    next_node_id = get_transition_node_id(current_node.transitions, "on_success")
 
                 if next_node_id:
                     logger.info(f"Next Node ID: {next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
@@ -479,12 +491,14 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
         if result["status"] == "timeout":
             logger.info(f"Prompt timeout occurred after DTMF", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-            next_node_id = current_node.transitions.get("on_timeout")
+            if current_node.transitions:
+                next_node_id = get_transition_node_id(current_node.transitions, "on_timeout")
         else:
             logger.info(f"Prompt heard within timeout", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             
             # Evaluate the Next Node ID
-            next_node_id = current_node.transitions.get("on_success")
+            if current_node.transitions:
+                next_node_id = get_transition_node_id(current_node.transitions, "on_success")
 
         if next_node_id:
             logger.info(f"Next Node ID:{next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
@@ -844,7 +858,8 @@ def dial_voicebot(channel_id, session):
         f"{ASTERISK_URL}/ari/channels",
         auth=(ARI_USER, ARI_PASS),
         params={
-            "endpoint": f"Local/{session['phone_to_dial']}@ivr-test-final",
+            "endpoint": f"PJSIP/{session['phone_to_dial']}@local-trunk",
+            # "endpoint": f"Local/{session['phone_to_dial']}@ivr-test-final",
             "app": APP_NAME,
             "appArgs": channel_id,
             "callerId": f"Vpro Test <{session['cli']}>"
@@ -859,7 +874,7 @@ def dial_voicebot(channel_id, session):
 def on_ari(ws, message):
 
     event = json.loads(message)
-    #print("on_ari: Incoming Event:", event)
+    print("on_ari: Incoming Event:", event)
     #print("on_ari: MR KAPS Event TYPE:", event["type"])
 
     if event["channel"]["name"].startswith("Local/") and event["channel"]["name"].endswith(";2"):
@@ -1159,6 +1174,8 @@ def load_test_case(session): #, json_file="ivr_test.json"):
 
     while current_node:
 
+        next_node_id = None
+
         print("_" * 100)
 
         print(f"NODE ID: {current_node.node_id}: ")
@@ -1189,16 +1206,16 @@ def load_test_case(session): #, json_file="ivr_test.json"):
 
         print("TRANSITIONS: ",current_node.transitions)
    
-        next_node_id = current_node.transitions.get(
-            "on_success"
-        )
+        if current_node.transitions:
+            next_node_id = get_transition_node_id(
+                current_node.transitions,
+                "on_success"
+            )
 
-        if not next_node_id:
+        if next_node_id:
+            current_node = test_case.get_node(next_node_id)
+        else:
             break
-
-        current_node = test_case.get_node(
-            next_node_id
-        )
 
     return test_case
 
@@ -1262,6 +1279,108 @@ def fetch_test_history(session):
 # RECORD NODE TEST HISTORY INTO THE DATABASE
 ################################################
 
+################################################
+# RTP STATS + MOS ESTIMATION
+################################################
+
+def get_rtp_stats(session, channel_id):
+
+    if not channel_id:
+        return None
+
+    try:
+        r = requests.get(
+            f"{ASTERISK_URL}/ari/channels/{channel_id}/rtp_statistics",
+            auth=(ARI_USER, ARI_PASS),
+            timeout=2
+        )
+
+        if r.status_code == 200:
+            return r.json()
+
+        logger.info(
+            f"RTP stats unavailable for channel {channel_id}: {r.status_code} {r.text}",
+            extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+    except Exception as e:
+        logger.info(
+            f"RTP stats error for channel {channel_id}: {e}",
+            extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+    return None
+
+
+def _safe_float(value, default=0.0):
+
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def estimate_mos_from_rtp_stats(stats):
+    """
+    Lightweight RTP-based estimated MOS.
+
+    This is not PESQ/POLQA. It is a practical node-test score derived from
+    ARI RTP stats such as jitter and packet loss so that every node can store
+    a useful, comparable RTP quality estimate.
+    """
+
+    if not stats:
+        return 0.00
+
+    jitter = max(
+        _safe_float(stats.get("remote_maxjitter")),
+        _safe_float(stats.get("local_maxjitter")),
+        _safe_float(stats.get("rxjitter")),
+        _safe_float(stats.get("txjitter")),
+        _safe_float(stats.get("jitter"))
+    )
+
+    packet_loss = max(
+        _safe_float(stats.get("remote_maxrxploss")),
+        _safe_float(stats.get("local_maxrxploss")),
+        _safe_float(stats.get("rxploss")),
+        _safe_float(stats.get("txploss")),
+        _safe_float(stats.get("packet_loss")),
+        _safe_float(stats.get("loss"))
+    )
+
+    mos = 4.5
+    mos -= min(jitter / 20.0, 1.0)
+    mos -= min(packet_loss * 0.25, 1.5)
+
+    return round(max(1.0, min(4.5, mos)), 2)
+
+
+def get_transition_node_id(transitions, event_name):
+
+    if not transitions:
+        return None
+
+    if isinstance(transitions, dict):
+        return transitions.get(event_name)
+
+    if isinstance(transitions, list):
+        for transition in transitions:
+            if not isinstance(transition, dict):
+                continue
+
+            if transition.get("type") == event_name or transition.get("condition") == event_name or transition.get("event") == event_name:
+                return (
+                    transition.get("next_node_id")
+                    or transition.get("target")
+                    or transition.get("node_id")
+                )
+
+    return None
+
+
 def record_test_history(session):
 
     sql = f""" 
@@ -1295,7 +1414,7 @@ def record_test_history(session):
             (
             session["test_execution_row_id"], 
             session["node_result"]["node_id"],
-            0.00, 
+            session["node_result"].get("mos", 0.00), 
             0.00, 
             session["node_result"]["actual_text"], 
             session["node_result"]["transcription_match"],
