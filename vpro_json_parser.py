@@ -1,7 +1,15 @@
 import json
+import re
 from dataclasses import dataclass
 from typing import Optional, Dict
 
+BARGEIN_RE = re.compile(r"\{\s*barge\s*-?\s*in\s*(?:after\s*=\s*(\d+(?:\.\d+)?))?\s*\}", re.I)
+
+def get_bargein_seconds(expected_text, default=0):
+    m = BARGEIN_RE.search(expected_text or "")
+    if not m:
+        return None
+    return float(m.group(1)) if m.group(1) else default
 
 @dataclass
 class Action:
@@ -33,7 +41,8 @@ class Node:
     minor_confidence_level: float
     major_confidence_level: float
     extended_attributes: Optional[Extended_Attributes]
-
+    bargein_timeout: float
+    
 @dataclass
 class Meta:
     test_execution_row_id: int
@@ -123,8 +132,8 @@ class IVRTestCase:
                 minor_confidence_level=node_data["minor_confidence_level"],
                 major_confidence_level=node_data["major_confidence_level"],
                 extended_attributes=extended_attributes,
-                transitions=node_data.get("transitions", {})
-
+                transitions=node_data.get("transitions", {}),
+                bargein_timeout=get_bargein_seconds(node_data["expected_text"])
             )
 
             self.nodes[node_id] = node

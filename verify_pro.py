@@ -161,7 +161,44 @@ def rtp_receiver():
         #At this stage we have the session object
         if session["node_transition"] == 1:
             session["node_transition"] = 0
-            print("Next Node Audio")
+            logger.info(f"Next Node Audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        try:
+            if session["bargein_timeout"] > 0 and session["bargein_timer_start"] == 0:
+                logger.info(f"BargeIn to be handled for {session['bargein_timeout']} Seconds", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+                session["bargein_timer_start"] = time.monotonic() #Starting Bargein Timer
+                session["bargein_timer"] = 0
+                # session["bargein_timeout"] = 0 #Resetting the Bargein Timeout
+            elif session["bargein_timer_start"] > 0:
+                bargein_lapsed_time = (time.monotonic() - session["bargein_timer_start"])
+                # logger.info(f"Bargein Lapsed Time: {bargein_lapsed_time} Seconds", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+                if session["bargein_timeout"] < bargein_lapsed_time:
+
+                    logger.info(f"Bargein Timed Out {session['bargein_timeout'] }: Triggering BargeIn after: {bargein_lapsed_time} Seconds", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+                    
+                    session["bargein_timeout"] = 0 #Resetting the Bargein Timeout
+                    session["bargein_timer_start"] = 0
+
+                    process_transcript = session["transcript"]
+                    session["transcript"] = ""
+
+                    sound_file = "request_id"#data["metadata"]["request_id"]
+                    base_path = f"{SOUNDS_DIR}/{sound_file}"
+
+                    voicebot_channel_id = session["voicebot_channel"]
+
+                    threading.Thread(
+                        target=process_nodedata,
+                        args=(process_transcript, base_path, voicebot_channel_id, channel_id)
+                    ).start()
+
+                    continue
+                else:
+                    session["bargein_timer"] += time.monotonic()-session["bargein_timer"]
+                    # logger.info(f"Bargein Timer : {session['bargein_timer']}, Bargein Timer Start: {session['bargein_timer_start']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        except Exception as e:              
+            print(f"An error occurred: {e}")
         
         if is_speech_packet(payload):
             #print("Speech packet")
@@ -222,7 +259,6 @@ def start_stt(channel_id):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
     return ws
-
 
 def on_stt(ws, message, channel_id):
 
@@ -328,6 +364,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
     if session:
         # Resetting next_prompt_heard session variable
         session["next_prompt_heard"] = 0
+
+        # Resetting bargein_timeout session variable
+        session["bargein_timeout"] = 0
+        session["bargein_timer_start"] = 0
 
         logger.info(f"Session Captured Variables:{session['captured_variables']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
         # logger.info(f"Session Object:{session}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
@@ -451,6 +491,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     current_node = session["test_case"].get_node(next_node_id)
                     if current_node:
                         session["current_node_id"] = current_node.node_id
+                        # Next node audio should be barged in after x seconds
+                        if current_node and current_node.bargein_timeout is not None:
+                            if current_node.bargein_timeout > 0:
+                                session["bargein_timeout"] = current_node.bargein_timeout
                     else:
                         session["current_node_id"] = "EOF" #Set End Of Flow here
                         # End the Test Case
@@ -496,9 +540,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         else:
             logger.info(f"Prompt heard within timeout", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             
-            # Evaluate the Next Node ID
+            # Evaluate the Next Node ID for Success
             if current_node.transitions:
                 next_node_id = get_transition_node_id(current_node.transitions, "on_success")
+
 
         if next_node_id:
             logger.info(f"Next Node ID:{next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
@@ -506,6 +551,10 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             current_node = session["test_case"].get_node(next_node_id)
             if current_node:
                 session["current_node_id"] = current_node.node_id
+                # Next node audio should be barged in after x seconds
+                if current_node and current_node.bargein_timeout is not None:
+                    if current_node.bargein_timeout > 0:
+                        session["bargein_timeout"] = current_node.bargein_timeout
             else:
                 session["current_node_id"] = "EOF" #currently node_fail_hangup matches here as Node Information is not available
                 # End the Test Case
@@ -1060,6 +1109,11 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
             "node_transition": 0,
             "execution_status": "RUNNING",
             "next_prompt_heard": 0,
+            # "bargein" : 0,
+            "initial_bargein_timeout": 0,
+            "bargein_timeout": 0,
+            "bargein_timer":0,
+            "bargein_timer_start":0,
 
             # Node results
             "node_result": [],
@@ -1139,6 +1193,8 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         session = call_sessions[parent_channel]
         logger.info(f"Caller Channel is Available", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
+        session["bargein_timeout"] = session["initial_bargein_timeout"]
+
         session["sip_call_id"] = get_pjsip_call_id(channel_id)
 
         session["bot_connect_time"] = datetime.datetime.now()
@@ -1182,7 +1238,7 @@ def load_test_case(session): #, json_file="ivr_test.json"):
     if not test_case:
         return None
     else:
-        print("test case could be loaded")
+        print("test case successfully loaded")
 
     # print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
     print("_" * 100)
@@ -1209,6 +1265,11 @@ def load_test_case(session): #, json_file="ivr_test.json"):
 
 
     current_node = test_case.get_start_node()
+
+    # Capture BargeIn Setting for the First Node
+    if current_node and current_node.bargein_timeout is not None:
+        if current_node.bargein_timeout > 0:
+            session["initial_bargein_timeout"] = current_node.bargein_timeout
 
     while current_node:
 
@@ -1720,21 +1781,21 @@ def get_pjsip_call_id(channel_id):
 
 def main():
 
-    print("Starting Voicebot")
+    print("Starting Verify Pro Application")
 
-    # TEMPORARY TAG MATCH CHECK [ REMOVE FOR PRODUCTION ]
-    # expect_to_hear="Hi {*} Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
-    # actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
-    expect_to_hear="Hi {choice x=kalpan:name|naik:surname} speaking Good {choice y=morning:AM|evening:PM}"
-    actual_prompt="Hi naik speaking Good evening"
+    # # TEMPORARY TAG MATCH CHECK [ REMOVE FOR PRODUCTION ]
+    # # expect_to_hear="Hi {*} Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
+    # # actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
+    # expect_to_hear="Hi {choice x=kalpan:name|naik:surname} speaking Good {choice y=morning:AM|evening:PM}"
+    # actual_prompt="Hi naik speaking Good evening"
 
-    result = validate_prompts(expect_to_hear, actual_prompt)
+    # result = validate_prompts(expect_to_hear, actual_prompt)
 
-    print("Captured Variables:")
-    for var_name, var_value in result.captured_variables.items():
-        print(f"{var_name} = {var_value}")
+    # print("Captured Variables:")
+    # for var_name, var_value in result.captured_variables.items():
+    #     print(f"{var_name} = {var_value}")
 
-    # print("Captured variable is x=",result.captured_variables["x"])
+    # # print("Captured variable is x=",result.captured_variables["x"])
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
@@ -1747,7 +1808,6 @@ def main():
     )
 
     ws.run_forever()
-
 
 if __name__ == "__main__":
     main()
