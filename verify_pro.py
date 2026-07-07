@@ -1331,7 +1331,8 @@ def fetch_test_history(session):
         WHERE vpterh.start_time = '0000-00-00 00:00:00'
         AND vpterh.end_time = '0000-00-00 00:00:00'
         AND vpterh.scheduled_on <= NOW()
-        AND vpterh.processed = 0
+        AND vpterh.execution_status = 1
+        AND verify_pro_test_execution_id = 151
         AND vpterh.status = 1
         ORDER BY vpterh.scheduled_on ASC
         LIMIT 1
@@ -1550,7 +1551,7 @@ def update_test_history(session, stage=0):
                     connect_time = %s,
                     pdd = %s,
                     callid = %s,
-                    processed = %s
+                    execution_status = %s
                     WHERE
                     id = %s
                     """
@@ -1568,7 +1569,7 @@ def update_test_history(session, stage=0):
                 session["bot_connect_time"], 
                 session["pdd"],
                 session["call_id"],
-                1, # In Progress
+                2, # Executing
                 session["test_execution_row_id"]
                 ))
         else:
@@ -1577,7 +1578,7 @@ def update_test_history(session, stage=0):
                     SET
                     end_time = %s,
                     call_ended_by = %s,
-                    processed = %s,
+                    execution_status = %s,
                     callid=%s
                     WHERE
                     id = %s
@@ -1592,7 +1593,7 @@ def update_test_history(session, stage=0):
                 (
                 session["bot_end_time"],
                 session["call_ended_by"], 
-                2, # Done
+                3, # Completed
                 session["sip_call_id"],
                 session["test_execution_row_id"]
                 ))

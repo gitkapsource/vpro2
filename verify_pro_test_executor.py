@@ -63,8 +63,9 @@ def fetch_test_history():
         WHERE vpterh.start_time = '0000-00-00 00:00:00'
         AND vpterh.end_time = '0000-00-00 00:00:00'
         AND vpterh.scheduled_on <= NOW()
-        AND vpterh.processed = 0
+        AND vpterh.execution_status = 1
         AND vpterh.status = 1
+        AND verify_pro_test_execution_id = 151
         ORDER BY vpterh.scheduled_on ASC
         LIMIT 1
     """
