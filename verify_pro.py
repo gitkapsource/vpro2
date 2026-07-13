@@ -125,6 +125,7 @@ def is_speech_packet(payload):
 ################################################
 # RTP Receiver (GLOBAL)
 ################################################
+
 def rtp_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", RTP_PORT))
@@ -160,6 +161,7 @@ def rtp_receiver():
         
         #At this stage we have the session object
         if session["node_transition"] == 1:
+            session["transcript"] = ""
             session["node_transition"] = 0
             logger.info(f"Next Node Audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
@@ -182,14 +184,17 @@ def rtp_receiver():
                     process_transcript = session["transcript"]
                     session["transcript"] = ""
 
+                    # session["node_transition"] = 1
+
                     sound_file = "request_id"#data["metadata"]["request_id"]
                     base_path = f"{SOUNDS_DIR}/{sound_file}"
 
                     voicebot_channel_id = session["voicebot_channel"]
+                    caller_channel = session["caller_channel"]
 
                     threading.Thread(
                         target=process_nodedata,
-                        args=(process_transcript, base_path, voicebot_channel_id, channel_id)
+                        args=(process_transcript, base_path, voicebot_channel_id, caller_channel)
                     ).start()
 
                     continue
@@ -263,6 +268,10 @@ def start_stt(channel_id):
 def on_stt(ws, message, channel_id):
 
     session = call_sessions[channel_id]
+
+    # if session["node_transition"] == 1:
+    #     logger.info(f"on_stt: Transcript:{transcript} | Probable BargeIn Effect : Skipping this Transcript", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+    #     return
 
     data = json.loads(message)
 
@@ -511,6 +520,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
         # Response generation based on Node Data
         logger.info(f"IVR Step Number:{session['ivr_step_number']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        # session["transcript"] = "" # Experimental
 
         if current_node.action_to_take.inject_type == "DTMF":
             send_dtmf(session, channel_id, current_node.action_to_take.value)
@@ -1165,9 +1176,9 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
     
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        transcript_file = f"/tmp/voicebot_{channel_id}_{timestamp}.txt"
-        open(transcript_file, "a").write(f"CALL START {timestamp}\n")
-        session["transcript_file"] = transcript_file
+        # transcript_file = f"/tmp/voicebot_{channel_id}_{timestamp}.txt"
+        # open(transcript_file, "a").write(f"CALL START {timestamp}\n")
+        # session["transcript_file"] = transcript_file
 
         bridge_id = create_bridge()
         session["bridge_id"] = bridge_id
@@ -1330,9 +1341,9 @@ def fetch_test_history(session):
         ON pcli.id = vpterh.provider_cli_id
         WHERE vpterh.start_time = '0000-00-00 00:00:00'
         AND vpterh.end_time = '0000-00-00 00:00:00'
+        AND vpterh.verify_pro_test_execution_id = 151
         AND vpterh.scheduled_on <= NOW()
         AND vpterh.execution_status = 1
-        AND verify_pro_test_execution_id = 151
         AND vpterh.status = 1
         ORDER BY vpterh.scheduled_on ASC
         LIMIT 1
