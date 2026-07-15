@@ -11,6 +11,8 @@ import audioop
 import random
 import datetime
 import asyncio
+import signal
+import atexit
 #from datetime import datetime, timezone
 from dataclasses import asdict
 
@@ -93,6 +95,12 @@ DEEPGRAM_API_KEY = "c55fbae3b46e73928316d000f602b8b200c9e4d0"
 call_sessions = {}
 rtp_sessions = {}
 
+shutdown_event = threading.Event()
+shutdown_lock = threading.Lock()
+shutdown_started = False
+ari_websocket = None
+rtp_socket = None
+
 # Dedicated queue for node processing. A single long-lived worker avoids
 # creating/scheduling a new thread at the exact barge-in boundary.
 node_processing_queue = queue.Queue()
@@ -144,13 +152,27 @@ def is_speech_packet(payload):
 # RTP Receiver (GLOBAL)
 ################################################
 def rtp_receiver():
+    global rtp_socket
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.0)
     sock.bind(("0.0.0.0", RTP_PORT))
+    rtp_socket = sock
 
-    print("RTP receiver started")
+    logger.info(
+        f"RTP receiver started on 0.0.0.0:{RTP_PORT}",
+        extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+    )
 
-    while True:
-        packet, addr = sock.recvfrom(2048)
+    while not shutdown_event.is_set():
+        try:
+            packet, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            if shutdown_event.is_set():
+                break
+            raise
 
         src_ip, src_port = addr
         payload = packet[12:]
@@ -230,7 +252,13 @@ def rtp_receiver():
 
                     threading.Thread(
                         target=process_nodedata,
-                        args=(process_transcript, base_path, voicebot_channel_id, session["caller_channel"])
+                        args=(
+                            process_transcript,
+                            base_path,
+                            voicebot_channel_id,
+                            session["caller_channel"]
+                        ),
+                        daemon=True
                     ).start()
 
                     # try:
@@ -308,6 +336,18 @@ def rtp_receiver():
         #     logger.info(f"No stt ws available to send audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         send_audio_to_stt(session, payload)
+
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+    rtp_socket = None
+
+    logger.info(
+        "RTP receiver stopped",
+        extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+    )
 
 
 ################################################
@@ -687,6 +727,51 @@ def ensure_stt_for_node(session, channel_id, current_node, force_restart=False):
         )
         hangup_channel(session, channel_id)
         return False
+
+def reset_stt_for_node(session, channel_id, current_node):
+    """Always start a fresh Amazon Transcribe stream for current_node."""
+    session["stt_accept_audio"] = False
+    session["transcript"] = ""
+
+    try:
+        new_stt = configure_stt_for_node(
+            session,
+            channel_id,
+            current_node,
+            force_restart=True
+        )
+    except Exception:
+        logger.exception(
+            f"Failed to reset AWS STT for node {current_node.node_id}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        return False
+
+    ready_event = new_stt.get("ready_event")
+    if not ready_event or not ready_event.wait(timeout=5.0):
+        logger.info(
+            f"AWS STT stream for node {current_node.node_id} "
+            f"did not become ready within 5 seconds",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        stop_stt(new_stt)
+        return False
+
+    session["stt_accept_audio"] = True
+    session["bargein_stt_reset_pending"] = False
+    session["prepared_stt_node_id"] = current_node.node_id
+
+    logger.info(
+        f"AWS STT reset for node {current_node.node_id}; "
+        f"languages={new_stt.get('language_options')}, "
+        f"generation={new_stt.get('generation')}",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+    return True
+
 
 def reset_stt_after_bargein(session, channel_id):
     """
@@ -1176,17 +1261,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     logger.info(f"Next Node ID: {next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
                     current_node = session["test_case"].get_node(next_node_id)
                     if current_node:
-                        force_restart = session.get("bargein_stt_reset_pending", False)
-                        if not ensure_stt_for_node(
+                        if not reset_stt_for_node(
                             session,
                             parent_channel_id,
-                            current_node,
-                            force_restart=force_restart
+                            current_node
                         ):
                             return
-                        if force_restart:
-                            session["bargein_stt_reset_pending"] = False
-                            session["stt_accept_audio"] = True
                         session["current_node_id"] = current_node.node_id
                         # Next node audio should be barged in after x seconds
                         if current_node and current_node.bargein_timeout is not None:
@@ -1235,23 +1315,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         )
 
         if predicted_next_node:
-            force_restart = session.get("bargein_stt_reset_pending", False)
-            if not ensure_stt_for_node(
+            if not reset_stt_for_node(
                 session,
                 parent_channel_id,
-                predicted_next_node,
-                force_restart=force_restart
+                predicted_next_node
             ):
                 return
-
-            if force_restart:
-                session["bargein_stt_reset_pending"] = False
-                session["stt_accept_audio"] = True
-                logger.info(
-                    f"AWS STT ready for next node {predicted_next_node.node_id} after barge-in",
-                    extra={"callid": session.get("call_id", "UNKNOWN"),
-                           "testid": session.get("test_execution_row_id", "UNKNOWN")}
-                )
 
         if current_node.action_to_take.inject_type == "DTMF":
             send_dtmf(session, channel_id, current_node.action_to_take.value)
@@ -1291,12 +1360,15 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
            
             current_node = session["test_case"].get_node(next_node_id)
             if current_node:
-                if not ensure_stt_for_node(
-                    session,
-                    parent_channel_id,
-                    current_node
-                ):
-                    return
+                if session.get("prepared_stt_node_id") != current_node.node_id:
+                    if not reset_stt_for_node(
+                        session,
+                        parent_channel_id,
+                        current_node
+                    ):
+                        return
+
+                session["prepared_stt_node_id"] = None
                 session["current_node_id"] = current_node.node_id
                 # Next node audio should be barged in after x seconds
                 if current_node and current_node.bargein_timeout is not None:
@@ -1557,7 +1629,8 @@ def hangup_channel(session, channel_id):
 
 def send_dtmf(session,channel_id, digits):
 
-    print("Sending DTMF :", digits, " on channel:", channel_id)
+    logger.info(f"Sending DTMF : {digits}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
     url = f"{ASTERISK_URL}/ari/channels/{channel_id}/dtmf"
 
     params = {
@@ -1833,6 +1906,7 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
             "stt_generation": 0,
             "stt_accept_audio": True,
             "bargein_stt_reset_pending": False,
+            "prepared_stt_node_id": None,
             "rtp_addr": None,
 
             # Voicebot Channel RTP specific
@@ -1987,89 +2061,89 @@ def load_test_case(session): #, json_file="ivr_test.json"):
     try:
         test_case = json_parse(session)
         # test_case = json_file_parse(session)
+        if test_case:
+            print("test case successfully loaded")
+        else:
+            return None
+        
+        # print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
+        print("_" * 100)
+            # print("Language IDs:", test_case.test_model_settings.language_ids)
+            # print("Persona:", test_case.test_model_settings.persona)
+            # print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
+            # print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
+            # print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
+            # print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
+
+            # if test_case.test_model_settings.extended_attributes:
+            #     print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
+
+            # node = test_case.get_node("node_102")
+
+            # print(node.node_type)
+            # print(node.expected_text)
+
+            # if node.action_to_take:
+            #     print(node.action_to_take.inject_type)
+            #     print(node.action_to_take.value)
+
+            # print(node.transitions)
+
+
+        current_node = test_case.get_start_node()
+
+        # Capture BargeIn Setting for the First Node
+        if current_node and current_node.bargein_timeout is not None:
+            if current_node.bargein_timeout > 0:
+                session["initial_bargein_timeout"] = current_node.bargein_timeout
+
+        while current_node:
+
+            next_node_id = None
+
+            print("_" * 100)
+
+            print(f"NODE ID: {current_node.node_id}: ")
+            print(f"EXPECTED TEXT: {current_node.expected_text}")
+
+            if current_node.action_to_take:
+                print("INJECT TYPE: ", current_node.action_to_take.inject_type)
+                print("ACTION DATA: ", current_node.action_to_take.value)
+
+            print("Language IDs:", current_node.language_ids)
+            print("Persona:", current_node.persona)
+
+            try:
+                if current_node.persona:
+                    for language_code in current_node.persona:
+                        if current_node.persona[language_code]["VI"]:
+                            print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
+            except:
+                pass
+
+            print("Minor Threshold Time:", current_node.minor_threshold_time)
+            print("Major Threshold Time:", current_node.major_threshold_time)
+            print("Minor Confidence Level:", current_node.minor_confidence_level)
+            print("Major Confidence Level:", current_node.major_confidence_level)
+
+            if current_node.extended_attributes:
+                print("Extended Attributes:", current_node.extended_attributes)
+
+            print("TRANSITIONS: ",current_node.transitions)
+    
+            if current_node.transitions:
+                next_node_id = get_transition_node_id(
+                    current_node.transitions,
+                    "on_success"
+                )
+
+            if next_node_id:
+                current_node = test_case.get_node(next_node_id)
+            else:
+                break
+            
     except Exception as e:
         print(f"An error occurred: {e}")
-
-    if test_case:
-        print("test case successfully loaded")
-    else:
-        return None
-        
-    # print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
-    print("_" * 100)
-        # print("Language IDs:", test_case.test_model_settings.language_ids)
-        # print("Persona:", test_case.test_model_settings.persona)
-        # print("Minor Threshold Time:", test_case.test_model_settings.minor_threshold_time)
-        # print("Major Threshold Time:", test_case.test_model_settings.major_threshold_time)
-        # print("Minor Confidence Level:", test_case.test_model_settings.minor_confidence_level)
-        # print("Major Confidence Level:", test_case.test_model_settings.major_confidence_level)
-
-        # if test_case.test_model_settings.extended_attributes:
-        #     print("Extended Attributes:", test_case.test_model_settings.extended_attributes)
-
-        # node = test_case.get_node("node_102")
-
-        # print(node.node_type)
-        # print(node.expected_text)
-
-        # if node.action_to_take:
-        #     print(node.action_to_take.inject_type)
-        #     print(node.action_to_take.value)
-
-        # print(node.transitions)
-
-
-    current_node = test_case.get_start_node()
-
-    # Capture BargeIn Setting for the First Node
-    if current_node and current_node.bargein_timeout is not None:
-        if current_node.bargein_timeout > 0:
-            session["initial_bargein_timeout"] = current_node.bargein_timeout
-
-    while current_node:
-
-        next_node_id = None
-
-        print("_" * 100)
-
-        print(f"NODE ID: {current_node.node_id}: ")
-        print(f"EXPECTED TEXT: {current_node.expected_text}")
-
-        if current_node.action_to_take:
-            print("INJECT TYPE: ", current_node.action_to_take.inject_type)
-            print("ACTION DATA: ", current_node.action_to_take.value)
-
-        print("Language IDs:", current_node.language_ids)
-        print("Persona:", current_node.persona)
-
-        try:
-            if current_node.persona:
-                for language_code in current_node.persona:
-                    if current_node.persona[language_code]["VI"]:
-                        print("Persona: ", language_code, " VoiceID ", current_node.persona[language_code]["VI"])
-        except:
-            pass
-
-        print("Minor Threshold Time:", current_node.minor_threshold_time)
-        print("Major Threshold Time:", current_node.major_threshold_time)
-        print("Minor Confidence Level:", current_node.minor_confidence_level)
-        print("Major Confidence Level:", current_node.major_confidence_level)
-
-        if current_node.extended_attributes:
-            print("Extended Attributes:", current_node.extended_attributes)
-
-        print("TRANSITIONS: ",current_node.transitions)
-   
-        if current_node.transitions:
-            next_node_id = get_transition_node_id(
-                current_node.transitions,
-                "on_success"
-            )
-
-        if next_node_id:
-            current_node = test_case.get_node(next_node_id)
-        else:
-            break
 
     return test_case
 
@@ -2438,114 +2512,248 @@ def update_test_history(session, stage=0):
         conn.close()
 
 ################################################
+# APPLICATION SHUTDOWN + ARI CLEANUP
+################################################
+
+def _system_log(message, level="info"):
+    log_method = getattr(logger, level, logger.info)
+    log_method(
+        message,
+        extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+    )
+
+
+def safe_ari_delete(resource_type, resource_id, timeout=3):
+    if not resource_id:
+        return False
+
+    try:
+        response = requests.delete(
+            f"{ASTERISK_URL}/ari/{resource_type}/{resource_id}",
+            auth=(ARI_USER, ARI_PASS),
+            timeout=timeout
+        )
+
+        if response.status_code in (200, 202, 204, 404):
+            return True
+
+        _system_log(
+            f"ARI delete failed for {resource_type}/{resource_id}: "
+            f"{response.status_code} {response.text}",
+            level="warning"
+        )
+    except Exception as exc:
+        _system_log(
+            f"ARI delete error for {resource_type}/{resource_id}: {exc}",
+            level="warning"
+        )
+
+    return False
+
+
+def cleanup_session_resources(session, remove_session=True):
+    if not session:
+        return
+
+    caller_channel = session.get("caller_channel")
+    voicebot_channel = session.get("voicebot_channel")
+    external_media = session.get("external_media")
+    snoop_channel = session.get("snoop_channel")
+    bridge_id = session.get("bridge_id")
+    stt_ws = session.get("stt_ws")
+    rtp_addr = session.get("rtp_addr")
+
+    session["stt_accept_audio"] = False
+
+    try:
+        stop_stt(stt_ws)
+    except Exception as exc:
+        _system_log(
+            f"Failed stopping STT for caller={caller_channel}: {exc}",
+            level="warning"
+        )
+
+    for channel_id in (
+        voicebot_channel,
+        external_media,
+        snoop_channel,
+        caller_channel,
+    ):
+        safe_ari_delete("channels", channel_id)
+
+    safe_ari_delete("bridges", bridge_id)
+
+    if rtp_addr:
+        rtp_sessions.pop(rtp_addr, None)
+
+    if remove_session and caller_channel:
+        call_sessions.pop(caller_channel, None)
+
+
+def cleanup_all_sessions():
+    global shutdown_started
+
+    with shutdown_lock:
+        if shutdown_started:
+            return
+        shutdown_started = True
+
+    shutdown_event.set()
+    _system_log("Application cleanup started")
+
+    try:
+        node_processing_queue.put_nowait(None)
+    except Exception:
+        pass
+
+    for session in list(call_sessions.values()):
+        try:
+            cleanup_session_resources(session, remove_session=False)
+        except Exception:
+            logger.exception(
+                "Unexpected error cleaning session",
+                extra={
+                    "callid": session.get("call_id", "UNKNOWN"),
+                    "testid": session.get("test_execution_row_id", "UNKNOWN")
+                }
+            )
+
+    call_sessions.clear()
+    rtp_sessions.clear()
+
+    if rtp_socket:
+        try:
+            rtp_socket.close()
+        except OSError:
+            pass
+
+    if ari_websocket:
+        try:
+            ari_websocket.close()
+        except Exception:
+            pass
+
+    _system_log("Application cleanup completed")
+
+
+def handle_shutdown_signal(signum, frame):
+    _system_log(f"Shutdown signal received: {signum}")
+    cleanup_all_sessions()
+
+
+def cleanup_stale_ari_resources():
+    _system_log("Checking for stale ARI resources")
+
+    try:
+        response = requests.get(
+            f"{ASTERISK_URL}/ari/channels",
+            auth=(ARI_USER, ARI_PASS),
+            timeout=5
+        )
+        response.raise_for_status()
+        channels = response.json()
+    except Exception as exc:
+        _system_log(
+            f"Unable to list ARI channels during startup cleanup: {exc}",
+            level="warning"
+        )
+        channels = []
+
+    stale_channel_ids = []
+
+    for channel in channels:
+        channel_id = channel.get("id")
+        channel_name = channel.get("name", "")
+        dialplan = channel.get("dialplan") or {}
+        app_name = dialplan.get("app_name", "")
+        app_data = dialplan.get("app_data", "")
+
+        belongs_to_app = (
+            app_name == "Stasis"
+            and APP_NAME in str(app_data)
+        )
+        is_external_media = channel_name.startswith("UnicastRTP/")
+
+        if belongs_to_app or is_external_media:
+            stale_channel_ids.append(channel_id)
+
+    for channel_id in stale_channel_ids:
+        safe_ari_delete("channels", channel_id)
+
+    try:
+        response = requests.get(
+            f"{ASTERISK_URL}/ari/bridges",
+            auth=(ARI_USER, ARI_PASS),
+            timeout=5
+        )
+        response.raise_for_status()
+        bridges = response.json()
+    except Exception as exc:
+        _system_log(
+            f"Unable to list ARI bridges during startup cleanup: {exc}",
+            level="warning"
+        )
+        bridges = []
+
+    for bridge in bridges:
+        bridge_id = bridge.get("id")
+        bridge_name = str(bridge.get("name", ""))
+        bridge_channels = bridge.get("channels") or []
+
+        if not bridge_channels or APP_NAME in bridge_name:
+            safe_ari_delete("bridges", bridge_id)
+
+    _system_log(
+        f"Startup cleanup removed {len(stale_channel_ids)} stale channels"
+    )
+
+
+################################################
 # CLEAN UP CALL STASIS END EVENT HANDLER
 ################################################
 
 def handle_stasis_end(session):
+    if not session:
+        return
 
-    bridge_id = session.get("bridge_id")
-    caller = session.get("caller_channel")
-    voicebot = session.get("voicebot_channel")
-    external_media = session.get("external_media")
-    stt_ws = session.get("stt_ws")
+    logger.info(
+        "Cleaning up call",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN")
+        }
+    )
 
-    print(bridge_id, caller, voicebot, external_media, stt_ws, sep=" | ")
-
-    logger.info(f"Cleaning up call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-
-    # Update test row execution history table with Call Start Information
     try:
-        if session["test_case"] is not None:
-            logger.info(f"Mark the End Time for this Call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        if session.get("test_case") is not None:
             session["bot_end_time"] = datetime.datetime.now()
             call_summary = calculate_call_level_summary(session)
             logger.info(
                 f"Call-level test summary: {call_summary}",
-                extra={"callid": session.get("call_id", "UNKNOWN"),
-                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                extra={
+                    "callid": session.get("call_id", "UNKNOWN"),
+                    "testid": session.get("test_execution_row_id", "UNKNOWN")
+                }
             )
             update_test_history(session, 1)
-    except:
-        pass
+    except Exception:
+        logger.exception(
+            "Failed updating final call history",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN")
+            }
+        )
 
-    # session = call_sessions.get(channel_id)
+    cleanup_session_resources(session, remove_session=True)
 
-    # if not session:
-    #     # maybe the voicebot channel triggered it
-    #     for cid, s in call_sessions.items():
-    #         if s.get("voicebot_channel") == channel_id:
-    #             session = s
-    #             channel_id = cid
-    #             break
-
-    # if not session:
-    #     print("Session not found")
-    #     return
-
-    try:
-        if caller:
-            print("Deleting Caller Channel:",caller)
-            requests.delete(
-                f"{ASTERISK_URL}/ari/channels/{caller}",
-                auth=(ARI_USER, ARI_PASS)
-            )
-    except:
-        pass
-
-    try:
-        if voicebot:
-            print("Deleting Voicebot Channel:",voicebot)
-            requests.delete(
-                f"{ASTERISK_URL}/ari/channels/{voicebot}",
-                auth=(ARI_USER, ARI_PASS)
-            )
-    except:
-        pass
-
-    try:
-        if bridge_id:
-            print("Deleting Bridge:",bridge_id)
-            requests.delete(
-                f"{ASTERISK_URL}/ari/bridges/{bridge_id}",
-                auth=(ARI_USER, ARI_PASS)
-            )
-    except:
-        pass
-
-    try:
-        if external_media:
-            print("Deleting External Media Channel:",external_media)
-            requests.delete(
-                f"{ASTERISK_URL}/ari/channels/{external_media}",
-                auth=(ARI_USER, ARI_PASS)
-            )
-    except:
-        pass
-
-    try:
-        if session.get("rtp_addr") in rtp_sessions:
-            # logger.info(f"Deleting RTP Session Map: {rtp_sessions[session['rtp_addr']]}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-            logger.info(f"Deleting RTP Session Map:", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-            del rtp_sessions[session["rtp_addr"]]
-    except:
-        pass
-
-    try:
-        if stt_ws:
-            logger.info(f"Deleting STT WS: {stt_ws}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-            stop_stt(stt_ws)
-    except:
-        pass
-
-    # if channel_id in call_sessions:
-    #     del call_sessions[channel_id]
-
-    logger.info(f"Call cleanup completed; Now deleting Session", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-    try:
-        del call_sessions[session["caller_channel"]]
-        del session
-    except:
-        pass
+    logger.info(
+        "Call cleanup completed",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN")
+        }
+    )
 
 
 
@@ -2611,37 +2819,53 @@ def get_pjsip_call_id(channel_id):
 ################################################
 
 def main():
+    global ari_websocket
 
-    print("Starting Verify Pro Application")
+    _system_log("Starting Verify Pro Application")
 
-    # # TEMPORARY TAG MATCH CHECK [ REMOVE FOR PRODUCTION ]
-    # # expect_to_hear="Hi {*} Hi Good Morning {BypassRecognition}Your PIN is {Digits Length=4} Thank you {*} Remaining Balance is {Currency} Let's meet {Date} at {Time} Pay {Number} to {AlphaNum Length=5} {Choice x=kalpan:1|aditya:2|satish:3}"
-    # # actual_prompt="Your PIN is 9 8 9 8 Thank you Buddy Remaining Balance is twenty dollars Let's meet yesterday at noon Pay twelve hundred five to ABC12 kalpan"
-    # expect_to_hear="Hi {choice x=kalpan:name|naik:surname} speaking Good {choice y=morning:AM|evening:PM}"
-    # actual_prompt="Hi naik speaking Good evening"
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    atexit.register(cleanup_all_sessions)
 
-    # result = validate_prompts(expect_to_hear, actual_prompt)
-
-    # print("Captured Variables:")
-    # for var_name, var_value in result.captured_variables.items():
-    #     print(f"{var_name} = {var_value}")
-
-    # # print("Captured variable is x=",result.captured_variables["x"])
-
-    # START DEDICATED NODE PROCESSING WORKER
+    cleanup_stale_ari_resources()
     ensure_node_processing_worker()
 
-    # START SINGLE RTP RECEIVER
-    threading.Thread(target=rtp_receiver, daemon=True).start()
+    rtp_thread = threading.Thread(
+        target=rtp_receiver,
+        daemon=True,
+        name="verifypro-rtp-receiver"
+    )
+    rtp_thread.start()
 
-    ari_ws = f"ws://127.0.0.1:8088/ari/events?app={APP_NAME}&api_key={ARI_USER}:{ARI_PASS}"
+    ari_ws_url = (
+        f"ws://127.0.0.1:8088/ari/events?"
+        f"app={APP_NAME}&api_key={ARI_USER}:{ARI_PASS}"
+    )
 
-    ws = websocket.WebSocketApp(
-        ari_ws,
+    ari_websocket = websocket.WebSocketApp(
+        ari_ws_url,
         on_message=on_ari
     )
 
-    ws.run_forever()
+    try:
+        ari_websocket.run_forever()
+    except KeyboardInterrupt:
+        handle_shutdown_signal(signal.SIGINT, None)
+    except Exception:
+        logger.exception(
+            "ARI WebSocket terminated unexpectedly",
+            extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+        )
+    finally:
+        cleanup_all_sessions()
+
+        if rtp_thread.is_alive():
+            rtp_thread.join(timeout=3)
+
+        try:
+            listener.stop()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
