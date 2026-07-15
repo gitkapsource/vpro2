@@ -10,6 +10,7 @@ import subprocess
 import audioop
 import random
 import datetime
+import asyncio
 #from datetime import datetime, timezone
 from dataclasses import asdict
 
@@ -19,6 +20,16 @@ from rapidfuzz import fuzz
 from prompt_validator import validate
 from vpro_json_parser import IVRTestCase
 from db_connection import get_db_conn
+
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
+
+AWS_REGION = "ap-south-1"   # or your Transcribe-supported region # TO BE READ FROM DEPLOYMENT CONFIG FILE
+# An AWS "final" result only completes one natural speech segment.  Wait for
+# transcript inactivity before treating the collected segments as one prompt.
+# Keep this comfortably above the roughly 300 ms pauses used by the IVR.
+AWS_PROMPT_IDLE_TIMEOUT_SECONDS = 2.0
 
 import re
 from difflib import SequenceMatcher
@@ -58,6 +69,7 @@ logger.addHandler(
     QueueHandler(log_queue)
 )
 
+
 ###########################################################
 NODE_TEST_FAILED = 0
 NODE_TEST_SATISFACTORY = 1
@@ -80,6 +92,12 @@ DEEPGRAM_API_KEY = "c55fbae3b46e73928316d000f602b8b200c9e4d0"
 
 call_sessions = {}
 rtp_sessions = {}
+
+# Dedicated queue for node processing. A single long-lived worker avoids
+# creating/scheduling a new thread at the exact barge-in boundary.
+node_processing_queue = queue.Queue()
+node_processing_worker_thread = None
+node_processing_worker_lock = threading.Lock()
 
 keywords_list = {
         "block",
@@ -125,7 +143,6 @@ def is_speech_packet(payload):
 ################################################
 # RTP Receiver (GLOBAL)
 ################################################
-
 def rtp_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", RTP_PORT))
@@ -161,8 +178,8 @@ def rtp_receiver():
         
         #At this stage we have the session object
         if session["node_transition"] == 1:
-            session["transcript"] = ""
             session["node_transition"] = 0
+            session["transcript"] = ""		
             logger.info(f"Next Node Audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         try:
@@ -174,30 +191,80 @@ def rtp_receiver():
             elif session["bargein_timer_start"] > 0:
                 bargein_lapsed_time = (time.monotonic() - session["bargein_timer_start"])
                 # logger.info(f"Bargein Lapsed Time: {bargein_lapsed_time} Seconds", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-                if session["bargein_timeout"] < bargein_lapsed_time:
+                if bargein_lapsed_time >= session["bargein_timeout"]:
 
-                    logger.info(f"Bargein Timed Out {session['bargein_timeout'] }: Triggering BargeIn after: {bargein_lapsed_time} Seconds", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-                    
-                    session["bargein_timeout"] = 0 #Resetting the Bargein Timeout
+                    session["bargein_timeout"] = 0
                     session["bargein_timer_start"] = 0
+                    session["bargein_timer"] = 0
+                    session["stt_accept_audio"] = False
 
-                    process_transcript = session["transcript"]
-                    session["transcript"] = ""
+                    logger.info(
+                        f"Bargein Timed Out {session['bargein_timeout']}: "
+                        f"Triggering BargeIn after {bargein_lapsed_time:.3f} Seconds",
+                        extra={"callid": session.get("call_id", "UNKNOWN"),
+                               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                    )
 
-                    # session["node_transition"] = 1
+                    # Capture only transcription received before the barge-in point.
+                    process_transcript = session.get("transcript", "").strip()
 
-                    sound_file = "request_id"#data["metadata"]["request_id"]
+                    # Completely invalidate the current AWS stream. Any late
+                    # partial/final result from it will fail _active_session().
+                    if not reset_stt_after_bargein(session, session["caller_channel"]):
+                        logger.info(
+                            "Failed to reset AWS STT after barge-in",
+                            extra={"callid": session.get("call_id", "UNKNOWN"),
+                                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                        )
+                        continue
+
+                    sound_file = f"bargein_{int(time.time() * 1000)}"
                     base_path = f"{SOUNDS_DIR}/{sound_file}"
-
                     voicebot_channel_id = session["voicebot_channel"]
-                    caller_channel = session["caller_channel"]
+
+                    logger.info(
+                        f"Starting node processing after barge-in; transcript={process_transcript!r}",
+                        extra={"callid": session.get("call_id", "UNKNOWN"),
+                               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                    )
 
                     threading.Thread(
                         target=process_nodedata,
-                        args=(process_transcript, base_path, voicebot_channel_id, caller_channel)
+                        args=(process_transcript, base_path, voicebot_channel_id, session["caller_channel"])
                     ).start()
 
-                    continue
+                    # try:
+                    #     if not ensure_node_processing_worker():
+                    #         raise RuntimeError(
+                    #             "Node processing worker is not running"
+                    #         )
+
+                    #     node_processing_queue.put_nowait(
+                    #         (
+                    #             process_transcript,
+                    #             base_path,
+                    #             voicebot_channel_id,
+                    #             channel_id
+                    #         )
+                    #     )
+
+                    #     logger.info(
+                    #         f"Queued barge-in node processing; "
+                    #         f"queue_size={node_processing_queue.qsize()}, "
+                    #         f"worker_alive="
+                    #         f"{node_processing_worker_thread.is_alive()}",
+                    #         extra={"callid": session.get("call_id", "UNKNOWN"),
+                    #                "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                    #     )
+                    # except Exception:
+                    #     logger.exception(
+                    #         "Failed to queue node processing after barge-in",
+                    #         extra={"callid": session.get("call_id", "UNKNOWN"),
+                    #                "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                    #     )
+
+                    # Do not continue here. The current RTP packet is routed to
+                    # the newly created stream below via send_audio_to_stt().
                 else:
                     session["bargein_timer"] += time.monotonic()-session["bargein_timer"]
                     # logger.info(f"Bargein Timer : {session['bargein_timer']}, Bargein Timer Start: {session['bargein_timer_start']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
@@ -228,50 +295,545 @@ def rtp_receiver():
         # else:
         #     print("Silence packet")
 
-        ws = session["stt_ws"]
+        # ws = session["stt_ws"]
 
-        if ws:
-            try:
-                # print("Sending payload to ws: ", ws)
-                ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
-            except:
-                pass
-        else:
-            # print("No stt ws available to send audio")
-            logger.info(f"No stt ws available to send audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        # if ws:
+        #     try:
+        #         # print("Sending payload to ws: ", ws)
+        #         ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
+        #     except:
+        #         pass
+        # else:
+        #     # print("No stt ws available to send audio")
+        #     logger.info(f"No stt ws available to send audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+        send_audio_to_stt(session, payload)
 
 
 ################################################
 # Deepgram STT
 ################################################
 
-def start_stt(channel_id):
+# def start_stt(channel_id):
 
-    url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&model=nova-3&language=multi"
-    #url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+#     url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&model=nova-3&language=multi"
+#     #url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
 
 
-    headers = [
-        f"Authorization: Token {DEEPGRAM_API_KEY}"
-    ]
+#     headers = [
+#         f"Authorization: Token {DEEPGRAM_API_KEY}"
+#     ]
 
-    ws = websocket.WebSocketApp(
-        url,
-        header=headers,
-        on_message=lambda ws, msg: on_stt(ws, msg, channel_id)
+#     ws = websocket.WebSocketApp(
+#         url,
+#         header=headers,
+#         on_message=lambda ws, msg: on_stt(ws, msg, channel_id)
+#     )
+
+#     threading.Thread(target=ws.run_forever, daemon=True).start()
+
+#     return ws
+
+################################################
+# AWS Transcribe STT
+################################################
+
+class AwsTranscriptHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream, channel_id, stt_generation):
+        super().__init__(output_stream)
+        self.channel_id = channel_id
+        self.stt_generation = stt_generation
+        self._final_segments = []
+        self._last_result_id = None
+        self._finalize_task = None
+
+    def _active_session(self):
+        session = call_sessions.get(self.channel_id)
+        if not session:
+            return None
+        if session.get("stt_generation") != self.stt_generation:
+            return None
+        return session
+
+    def _combined_transcript(self, partial_transcript=""):
+        parts = [*self._final_segments]
+        if partial_transcript:
+            parts.append(partial_transcript)
+        return " ".join(parts).strip()
+
+    def _restart_finalize_timer(self):
+        if not self._final_segments:
+            return
+
+        if self._finalize_task and not self._finalize_task.done():
+            self._finalize_task.cancel()
+
+        self._finalize_task = asyncio.create_task(
+            self._finalize_after_inactivity()
+        )
+
+    async def _finalize_after_inactivity(self):
+        try:
+            await asyncio.sleep(AWS_PROMPT_IDLE_TIMEOUT_SECONDS)
+            self._flush_final_segments()
+        except asyncio.CancelledError:
+            # A new partial/final result arrived, so the prompt is continuing.
+            raise
+        finally:
+            if self._finalize_task is asyncio.current_task():
+                self._finalize_task = None
+
+    def _flush_final_segments(self):
+        process_transcript = self._combined_transcript()
+        if not process_transcript:
+            return
+
+        session = self._active_session()
+        result_id = self._last_result_id or "aws_transcript"
+
+        self._final_segments = []
+        self._last_result_id = None
+
+        if not session:
+            return
+
+        session["transcript"] = ""
+
+        logger.info(
+            f"on_stt: Prompt finalized after "
+            f"{AWS_PROMPT_IDLE_TIMEOUT_SECONDS:.2f}s inactivity: "
+            f"{process_transcript}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+        base_path = f"{SOUNDS_DIR}/{result_id}"
+        voicebot_channel_id = session["voicebot_channel"]
+
+        threading.Thread(
+            target=process_nodedata,
+            args=(process_transcript, base_path, voicebot_channel_id, self.channel_id)
+        ).start()
+
+    async def flush_pending(self):
+        """Flush buffered final segments when the AWS stream is closing."""
+        pending_task = self._finalize_task
+        self._finalize_task = None
+
+        if pending_task and not pending_task.done():
+            pending_task.cancel()
+            try:
+                await pending_task
+            except asyncio.CancelledError:
+                pass
+
+        self._flush_final_segments()
+
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        session = self._active_session()
+        if not session:
+            return
+
+        for result in transcript_event.transcript.results:
+            if not result.alternatives:
+                continue
+
+            transcript = result.alternatives[0].transcript.strip()
+            if not transcript:
+                continue
+
+            if result.is_partial:
+                
+                logger.info(f"on_stt: Transcript:{transcript}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+                session["transcript"] = self._combined_transcript(transcript)
+
+                # Partial speech after a final segment means that the prompt is
+                # still continuing.  Restart the inactivity window.
+                self._restart_finalize_timer()
+
+                # write_transcript(self.channel_id, "Caller", transcript)
+
+                # Let's check the interim Transcript to match any test keywords and barge-in
+                """
+                if fuzzy_match(transcript, keywords_list, session) is not None:
+
+                    process_transcript = session["transcript"]
+                    session["transcript"] = ""
+
+                    sound_file = data["metadata"]["request_id"]
+                    base_path = f"{SOUNDS_DIR}/{sound_file}"
+
+                    voicebot_channel_id = session["voicebot_channel"]
+
+                    threading.Thread(
+                        target=process_nodedata,
+                        args=(process_transcript, base_path, voicebot_channel_id, channel_id)
+                    ).start()
+                """
+            else:
+                self._final_segments.append(transcript)
+                self._last_result_id = result.result_id
+                session["transcript"] = self._combined_transcript()
+
+                logger.info(
+                    f"on_stt: AWS segment final; waiting for prompt inactivity: "
+                    f"{session['transcript']}",
+                    extra={"callid": session.get("call_id", "UNKNOWN"),
+                           "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                )
+
+                self._restart_finalize_timer()
+
+            """
+            # Similar to Deepgram interim/final handling
+            if result.is_partial:
+                logger.info(
+                    f"AWS STT partial: {transcript}",
+                    extra={"callid": session.get("call_id", "UNKNOWN"),
+                           "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                )
+            else:
+                logger.info(
+                    f"AWS STT final: {transcript}",
+                    extra={"callid": session.get("call_id", "UNKNOWN"),
+                           "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                )
+
+                session["transcript"] += " " + transcript
+            """
+
+def parse_transcribe_language_options(language_ids):
+    """Normalize a node's comma-separated AWS language codes."""
+    if isinstance(language_ids, str):
+        raw_options = language_ids.split(",")
+    elif language_ids:
+        raw_options = language_ids
+    else:
+        raw_options = []
+
+    language_options = []
+    for option in raw_options:
+        language_code = str(option).strip().strip("\"'")
+        if language_code and language_code not in language_options:
+            language_options.append(language_code)
+
+    if not language_options:
+        raise ValueError("At least one AWS Transcribe language ID is required")
+
+    # AWS language identification accepts only one dialect per language.
+    language_dialects = {}
+    for language_code in language_options:
+        language = language_code.split("-", 1)[0].lower()
+        previous_dialect = language_dialects.get(language)
+        if previous_dialect and previous_dialect != language_code:
+            raise ValueError(
+                "AWS Transcribe language identification cannot combine "
+                f"{previous_dialect} and {language_code} in one stream"
+            )
+        language_dialects[language] = language_code
+
+    return language_options
+
+
+def build_transcribe_settings(language_options):
+    settings = {
+        "media_sample_rate_hz": 8000,
+        "media_encoding": "pcm",
+    }
+
+    if len(language_options) == 1:
+        settings["language_code"] = language_options[0]
+    else:
+        settings.update({
+            "language_code": None,
+            "identify_multiple_languages": True,
+            "language_options": language_options,
+            "preferred_language": language_options[0],
+        })
+
+    return settings
+
+
+async def _discard_audio_and_stop(audio_queue):
+    # Discard audio already queued for the interrupted/obsolete prompt.
+    while True:
+        try:
+            audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    await audio_queue.put(None)
+
+
+def stop_stt(stt):
+    if not stt:
+        return
+
+    loop = stt.get("loop")
+    audio_queue = stt.get("queue")
+    if not loop or not audio_queue or loop.is_closed():
+        return
+
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _discard_audio_and_stop(audio_queue),
+            loop
+        )
+    except RuntimeError:
+        pass
+
+
+def start_stt(channel_id, language_ids, stt_generation):
+
+    language_options = parse_transcribe_language_options(language_ids)
+
+    audio_queue = asyncio.Queue(maxsize=100)
+
+    loop = asyncio.new_event_loop()
+
+    def runner():
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                aws_transcribe_worker(
+                    channel_id,
+                    audio_queue,
+                    language_options,
+                    stt_generation,
+                    ready_event
+                )
+            )
+        except Exception as e:
+            session = call_sessions.get(channel_id, {})
+            logger.info(
+                f"AWS STT worker failed: {e}",
+                extra={"callid": session.get("call_id", "UNKNOWN"),
+                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+            )
+        finally:
+            loop.close()
+
+    ready_event = threading.Event()
+
+    worker_thread = threading.Thread(
+        target=runner,
+        daemon=True,
+        name=f"aws-stt-{channel_id}-{stt_generation}"
+    )
+    worker_thread.start()
+
+    return {
+        "provider": "aws_transcribe",
+        "loop": loop,
+        "queue": audio_queue,
+        "language_options": language_options,
+        "generation": stt_generation,
+        "ready_event": ready_event,
+        "thread": worker_thread
+    }
+
+
+def configure_stt_for_node(session, channel_id, current_node, force_restart=False):
+    language_options = parse_transcribe_language_options(
+        current_node.language_ids
+    )
+    current_stt = session.get("stt_ws")
+
+    if (
+        not force_restart
+        and current_stt
+        and current_stt.get("language_options") == language_options
+    ):
+        return current_stt
+
+    next_generation = session.get("stt_generation", 0) + 1
+    new_stt = start_stt(
+        channel_id,
+        language_options,
+        next_generation
     )
 
-    threading.Thread(target=ws.run_forever, daemon=True).start()
+    # Route new audio first, then invalidate and stop the old stream.  The
+    # generation check prevents late results from the old stream being used.
+    session["stt_ws"] = new_stt
+    session["stt_generation"] = next_generation
+    stop_stt(current_stt)
 
-    return ws
+    logger.info(
+        f"AWS STT configured for node {current_node.node_id}: "
+        f"{language_options}",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+    return new_stt
+
+
+def ensure_stt_for_node(session, channel_id, current_node, force_restart=False):
+    try:
+        configure_stt_for_node(
+            session,
+            channel_id,
+            current_node,
+            force_restart=force_restart
+        )
+        return True
+    except ValueError as e:
+        logger.info(
+            f"Invalid AWS STT language options for node "
+            f"{current_node.node_id}: {e}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        hangup_channel(session, channel_id)
+        return False
+
+def reset_stt_after_bargein(session, channel_id):
+    """
+    Open the replacement AWS stream first, then atomically switch routing.
+
+    This prevents a window where RTP is sent to a stream whose event loop is
+    alive but whose Amazon bidirectional stream has not opened yet.
+    """
+    old_stt = session.get("stt_ws")
+
+    if not old_stt:
+        logger.info(
+            "Cannot reset AWS STT after barge-in: current stream is missing",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        return False
+
+    language_options = old_stt.get("language_options")
+    next_generation = session.get("stt_generation", 0) + 1
+
+    try:
+        new_stt = start_stt(
+            channel_id,
+            language_options,
+            next_generation
+        )
+    except Exception:
+        logger.exception(
+            "Failed to create replacement AWS STT stream after barge-in",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        return False
+
+    ready_event = new_stt.get("ready_event")
+    if not ready_event or not ready_event.wait(timeout=5.0):
+        logger.info(
+            "Replacement AWS STT stream did not become ready within 5 seconds",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        stop_stt(new_stt)
+        return False
+
+    session["stt_ws"] = new_stt
+    session["stt_generation"] = next_generation
+    session["stt_accept_audio"] = True
+    session["bargein_stt_reset_pending"] = True
+    session["transcript"] = ""
+
+    stop_stt(old_stt)
+
+    logger.info(
+        f"AWS STT switched after barge-in; generation={next_generation}, "
+        f"languages={language_options}",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+    return True
+
+def send_audio_to_stt(session, payload):
+    if not session.get("stt_accept_audio", True):
+        logger.info(
+        f"STT Accept Audio is still False: NOT SENDING AUDIO TO STT ",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        return
+
+    stt = session.get("stt_ws")
+
+    if not stt or stt["loop"].is_closed():
+        return
+
+    pcm = audioop.ulaw2lin(payload, 2)
+
+    try:
+        asyncio.run_coroutine_threadsafe(
+            stt["queue"].put(pcm),
+            stt["loop"]
+        )
+    except Exception as e:
+        logger.info(
+            f"AWS STT queue send failed: {e}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+
+async def aws_transcribe_worker(
+    channel_id,
+    audio_queue,
+    language_options,
+    stt_generation,
+    ready_event
+):
+    client = TranscribeStreamingClient(region=AWS_REGION)
+
+    transcription_settings = build_transcribe_settings(language_options)
+    stream = await client.start_stream_transcription(**transcription_settings)
+    ready_event.set()
+
+    session = call_sessions.get(channel_id, {})
+    logger.info(
+        f"AWS STT stream ready; generation={stt_generation}",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+
+    async def send_audio():
+        silence = b"\x00" * 320  # 20ms of 8kHz 16-bit PCM silence
+
+        while True:
+            try:
+                chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                chunk = silence
+
+            if chunk is None:
+                break
+
+            await stream.input_stream.send_audio_event(audio_chunk=chunk)
+
+        await stream.input_stream.end_stream()
+        
+    handler = AwsTranscriptHandler(
+        stream.output_stream,
+        channel_id,
+        stt_generation
+    )
+
+    async def receive_transcripts():
+        try:
+            await handler.handle_events()
+        finally:
+            await handler.flush_pending()
+
+    await asyncio.gather(
+        send_audio(),
+        receive_transcripts()
+    )
+
 
 def on_stt(ws, message, channel_id):
 
     session = call_sessions[channel_id]
-
-    # if session["node_transition"] == 1:
-    #     logger.info(f"on_stt: Transcript:{transcript} | Probable BargeIn Effect : Skipping this Transcript", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-    #     return
 
     data = json.loads(message)
 
@@ -361,6 +923,110 @@ def write_transcript(channel_id, speaker, text):
 # LLM + TTS
 ################################################
 
+def ensure_node_processing_worker():
+    """Start the node worker once, even when this module is imported."""
+    global node_processing_worker_thread
+
+    with node_processing_worker_lock:
+        if (
+            node_processing_worker_thread
+            and node_processing_worker_thread.is_alive()
+        ):
+            return True
+
+        node_processing_worker_thread = threading.Thread(
+            target=node_processing_worker,
+            daemon=True,
+            name="verifypro-node-worker"
+        )
+        node_processing_worker_thread.start()
+
+    # Give the new worker a brief opportunity to enter its queue loop.
+    time.sleep(0.01)
+
+    if not node_processing_worker_thread.is_alive():
+        logger.info(
+            "Node processing worker failed to start",
+            extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+        )
+        return False
+
+    return True
+
+
+def node_processing_worker():
+    print("Node processing worker started", flush=True)
+
+    logger.info(
+        "Node processing worker started",
+        extra={"callid": "SYSTEM", "testid": "SYSTEM"}
+    )
+
+    while True:
+        job = node_processing_queue.get()
+
+        if job is None:
+            node_processing_queue.task_done()
+            return
+
+        args = job
+        parent_channel_id = args[3] if len(args) > 3 else None
+        session = call_sessions.get(parent_channel_id, {})
+
+        print(
+            f"Node processing worker received job: channel={parent_channel_id}",
+            flush=True
+        )
+
+        logger.info(
+            f"Node processing worker received job; channel={parent_channel_id}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+        try:
+            process_nodedata_safe(*args)
+        except Exception:
+            logger.exception(
+                "Node processing worker failed",
+                extra={"callid": session.get("call_id", "UNKNOWN"),
+                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+            )
+        finally:
+            node_processing_queue.task_done()
+
+
+def process_nodedata_safe(*args):
+    parent_channel_id = args[3] if len(args) > 3 else None
+    session = call_sessions.get(parent_channel_id, {})
+
+    print(
+        f"Entered process_nodedata_safe after barge-in: "
+        f"channel={parent_channel_id}",
+        flush=True
+    )
+
+    logger.info(
+        "Entered process_nodedata thread after barge-in",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+
+    try:
+        process_nodedata(*args)
+        logger.info(
+            "process_nodedata thread completed after barge-in",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+    except Exception:
+        logger.exception(
+            "Unhandled exception in process_nodedata after barge-in",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+
 def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_id):
 
     #expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
@@ -406,9 +1072,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                 current_node.expected_text = current_node.expected_text.replace(placeholder, str(var_value))
 
         # For debugging print the node test details
-        # print_node_test_details(session, current_node)
+        print_node_test_details(session, current_node)
         
         # Validate Expected_Text vs Actual_Text
+        logger.info(f"Expected Text: {current_node.expected_text}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+        logger.info(f"Actual Text: {transcript_text}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
         result = validate_prompts(current_node.expected_text,transcript_text)
 
         if (result.captured_variables and any(result.captured_variables.values())):
@@ -449,6 +1118,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             "response_time": session["bot_avg_latency"],
             "test_result": json.dumps(asdict(result),ensure_ascii=False),
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), #"2026-06-22T18:21:55Z"
+            "node_test_response_time": node_test_response_time,
+            "node_test_match_percentage": node_test_match_percentage,
             "node_test_result": node_test_result 
         }
 
@@ -461,6 +1132,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         logger.info(
             f"RTP Stats: {rtp_stats}, Estimated MOS: {session['node_result']['mos']}",
             extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+        # Retain every node's classifications for the call-level majority
+        # calculation performed when the call ends.
+        session.setdefault("node_results", []).append(
+            dict(session["node_result"])
         )
 
         # Insert Test History Data into the DB
@@ -499,6 +1176,17 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     logger.info(f"Next Node ID: {next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
                     current_node = session["test_case"].get_node(next_node_id)
                     if current_node:
+                        force_restart = session.get("bargein_stt_reset_pending", False)
+                        if not ensure_stt_for_node(
+                            session,
+                            parent_channel_id,
+                            current_node,
+                            force_restart=force_restart
+                        ):
+                            return
+                        if force_restart:
+                            session["bargein_stt_reset_pending"] = False
+                            session["stt_accept_audio"] = True
                         session["current_node_id"] = current_node.node_id
                         # Next node audio should be barged in after x seconds
                         if current_node and current_node.bargein_timeout is not None:
@@ -515,13 +1203,55 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
                 return
 
-        except:
-            pass
+        except Exception:
+            logger.exception(
+                "Error while preparing node action or transition",
+                extra={"callid": session.get("call_id", "UNKNOWN"),
+                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+            )
 
         # Response generation based on Node Data
         logger.info(f"IVR Step Number:{session['ivr_step_number']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
-        # session["transcript"] = "" # Experimental
+        # Prepare the STT stream for the prompt expected after this action.
+        # This happens before DTMF/TTS/Speech triggers the next IVR response so
+        # its first audio packets are queued for the correctly configured stream.
+        predicted_next_node_id = None
+        if current_node.transitions:
+            predicted_next_node_id = get_transition_node_id(
+                current_node.transitions,
+                "on_success"
+            )
+        predicted_next_node = None
+        if predicted_next_node_id:
+            predicted_next_node = session["test_case"].get_node(
+                predicted_next_node_id
+            )
+
+        logger.info(
+            f"Predicted next node before action: {predicted_next_node_id}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+
+        if predicted_next_node:
+            force_restart = session.get("bargein_stt_reset_pending", False)
+            if not ensure_stt_for_node(
+                session,
+                parent_channel_id,
+                predicted_next_node,
+                force_restart=force_restart
+            ):
+                return
+
+            if force_restart:
+                session["bargein_stt_reset_pending"] = False
+                session["stt_accept_audio"] = True
+                logger.info(
+                    f"AWS STT ready for next node {predicted_next_node.node_id} after barge-in",
+                    extra={"callid": session.get("call_id", "UNKNOWN"),
+                           "testid": session.get("test_execution_row_id", "UNKNOWN")}
+                )
 
         if current_node.action_to_take.inject_type == "DTMF":
             send_dtmf(session, channel_id, current_node.action_to_take.value)
@@ -561,6 +1291,12 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
            
             current_node = session["test_case"].get_node(next_node_id)
             if current_node:
+                if not ensure_stt_for_node(
+                    session,
+                    parent_channel_id,
+                    current_node
+                ):
+                    return
                 session["current_node_id"] = current_node.node_id
                 # Next node audio should be barged in after x seconds
                 if current_node and current_node.bargein_timeout is not None:
@@ -1094,6 +1830,9 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
             "transcript": "",
             "transcript_file": None,
             "stt_ws": None,
+            "stt_generation": 0,
+            "stt_accept_audio": True,
+            "bargein_stt_reset_pending": False,
             "rtp_addr": None,
 
             # Voicebot Channel RTP specific
@@ -1128,12 +1867,16 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
             # Node results
             "node_result": [],
+            "node_results": [],
 
             # Overall metrics
             "summary": {
                 "total_nodes": 0,
                 "passed_nodes": 0,
+                "satisfactory_nodes": 0,
                 "failed_nodes": 0,
+                "node_test_response_time": None,
+                "node_test_match_percentage": None,
                 "overall_result": None
             },
 
@@ -1143,11 +1886,6 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
         session = call_sessions[channel_id]
         logger.info(f"Caller Channel is Not Available: Fresh Call", extra={"callid":sip_call_id,"testid":session.get("test_execution_row_id", "UNKNOWN")})
-
-        # create stt_ws socket
-        stt_ws = start_stt(channel_id)
-        session["stt_ws"] = stt_ws
-        logger.info(f"stt_ws created: {session['stt_ws']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         # Fetch the Test Data
         fetch_test_history(session)
@@ -1168,6 +1906,19 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         if test_case.meta.phone_to_dial is not None:
             session["phone_to_dial"] = test_case.meta.phone_to_dial
 
+        current_node = test_case.get_start_node()
+        if current_node is None:
+            logger.info(
+                "Test case has no start node for AWS STT configuration",
+                extra={"callid": session.get("call_id", "UNKNOWN"),
+                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+            )
+            hangup_channel(session, channel_id)
+            return
+
+        if not ensure_stt_for_node(session, channel_id, current_node):
+            return
+
         # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
         #(f"[Exec:{session['test_execution_row_id']}] "
 
@@ -1182,13 +1933,6 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
         bridge_id = create_bridge()
         session["bridge_id"] = bridge_id
-
-        # Pass the Language Code to the Realtime STT
-        #test_case.get_start_node().language_ids
-        # stt_ws = start_stt(channel_id)
-        # session["stt_ws"] = stt_ws
-
-        # logger.info(f"stt_ws created: {session['stt_ws']}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
         ext_media = create_external_media()
         session["external_media"] = ext_media
@@ -1246,11 +1990,11 @@ def load_test_case(session): #, json_file="ivr_test.json"):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-    if not test_case:
-        return None
-    else:
+    if test_case:
         print("test case successfully loaded")
-
+    else:
+        return None
+        
     # print("PHONE NUMBER: ", test_case.meta.phone_to_dial)
     print("_" * 100)
         # print("Language IDs:", test_case.test_model_settings.language_ids)
@@ -1341,8 +2085,8 @@ def fetch_test_history(session):
         ON pcli.id = vpterh.provider_cli_id
         WHERE vpterh.start_time = '0000-00-00 00:00:00'
         AND vpterh.end_time = '0000-00-00 00:00:00'
-        AND vpterh.verify_pro_test_execution_id = 151
         AND vpterh.scheduled_on <= NOW()
+        AND verify_pro_test_execution_id = 151
         AND vpterh.execution_status = 1
         AND vpterh.status = 1
         ORDER BY vpterh.scheduled_on ASC
@@ -1490,6 +2234,75 @@ def get_transition_node_id(transitions, event_name):
                 )
 
     return None
+
+
+def majority_test_result(results):
+    """Return the most common result, choosing the worse result on ties."""
+    valid_results = [
+        result for result in results
+        if result in (
+            NODE_TEST_FAILED,
+            NODE_TEST_SATISFACTORY,
+            NODE_TEST_SUCCESS
+        )
+    ]
+    if not valid_results:
+        return None
+
+    counts = {
+        NODE_TEST_FAILED: valid_results.count(NODE_TEST_FAILED),
+        NODE_TEST_SATISFACTORY: valid_results.count(NODE_TEST_SATISFACTORY),
+        NODE_TEST_SUCCESS: valid_results.count(NODE_TEST_SUCCESS),
+    }
+    highest_count = max(counts.values())
+
+    # The constants are ordered from worst (0) to best (2), so min() gives a
+    # deterministic, conservative result if two categories have equal votes.
+    return min(
+        result for result, count in counts.items()
+        if count == highest_count
+    )
+
+
+def calculate_call_level_summary(session):
+    node_results = session.get("node_results", [])
+
+    response_time_results = [
+        result.get("node_test_response_time")
+        for result in node_results
+    ]
+    match_percentage_results = [
+        result.get("node_test_match_percentage")
+        for result in node_results
+    ]
+    combined_results = [
+        result.get("node_test_result")
+        for result in node_results
+    ]
+
+    response_time_result = majority_test_result(response_time_results)
+    match_percentage_result = majority_test_result(match_percentage_results)
+
+    call_results = [
+        result for result in (
+            response_time_result,
+            match_percentage_result
+        )
+        if result is not None
+    ]
+
+    summary = session.setdefault("summary", {})
+    summary.update({
+        "total_nodes": len(node_results),
+        "passed_nodes": combined_results.count(NODE_TEST_SUCCESS),
+        "satisfactory_nodes": combined_results.count(NODE_TEST_SATISFACTORY),
+        "failed_nodes": combined_results.count(NODE_TEST_FAILED),
+        "node_test_response_time": response_time_result,
+        "node_test_match_percentage": match_percentage_result,
+        "overall_result": min(call_results) if call_results else None,
+    })
+
+    return summary
 
 
 def record_test_history(session):
@@ -1645,6 +2458,12 @@ def handle_stasis_end(session):
         if session["test_case"] is not None:
             logger.info(f"Mark the End Time for this Call", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
             session["bot_end_time"] = datetime.datetime.now()
+            call_summary = calculate_call_level_summary(session)
+            logger.info(
+                f"Call-level test summary: {call_summary}",
+                extra={"callid": session.get("call_id", "UNKNOWN"),
+                       "testid": session.get("test_execution_row_id", "UNKNOWN")}
+            )
             update_test_history(session, 1)
     except:
         pass
@@ -1714,7 +2533,7 @@ def handle_stasis_end(session):
     try:
         if stt_ws:
             logger.info(f"Deleting STT WS: {stt_ws}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
-            stt_ws.close()
+            stop_stt(stt_ws)
     except:
         pass
 
@@ -1743,8 +2562,8 @@ def validate_prompts(expect_to_hear:str, actual_prompt:str):
     print("=====================================================")
     print("Expect to Hear:",expect_to_hear)
     print("Actual Prompt:",actual_prompt)
-    print("Matched: ",result.matched)
-    print("Match %:",result.match_percentage)
+    # print("Matched: ",result.matched)
+    # print("Match %:",result.match_percentage)
     print("Match %:",result.word_match_percentage)
     print("FULL RESULT:\n",result)
     print("=====================================================")
@@ -1808,6 +2627,9 @@ def main():
     #     print(f"{var_name} = {var_value}")
 
     # # print("Captured variable is x=",result.captured_variables["x"])
+
+    # START DEDICATED NODE PROCESSING WORKER
+    ensure_node_processing_worker()
 
     # START SINGLE RTP RECEIVER
     threading.Thread(target=rtp_receiver, daemon=True).start()
