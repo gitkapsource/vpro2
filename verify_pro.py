@@ -13,6 +13,8 @@ import datetime
 import asyncio
 import signal
 import atexit
+import wave
+import shlex
 #from datetime import datetime, timezone
 from dataclasses import asdict
 
@@ -73,6 +75,10 @@ logger.addHandler(
 
 
 ###########################################################
+
+#phonexia config
+PHONEXIA_PATH = "/usr/src/scripts/phonexia/SQE-D1-cmd-3.50.5-lin64"
+
 NODE_TEST_FAILED = 0
 NODE_TEST_SATISFACTORY = 1
 NODE_TEST_SUCCESS = 2
@@ -89,6 +95,9 @@ ASTERISK_RTP_PORT = 7000
 ASTERISK_IP = "127.0.0.1"
 
 SOUNDS_DIR = "/var/lib/asterisk/sounds"
+
+NODE_RECORDING_DIR = "/var/lib/asterisk/recordings/verifypro_nodes"
+MOS_COMMAND = os.getenv("MOS_COMMAND", "").strip()
 
 DEEPGRAM_API_KEY = "c55fbae3b46e73928316d000f602b8b200c9e4d0"
 
@@ -116,6 +125,53 @@ keywords_list = {
         # "account",
         # "automated"
 }
+
+def get_phoneix_pesq_score(filepath,try_cnt=1):
+        filename = filepath.split('/')[-1]
+        op_filename = '/tmp/'+filename.replace('.wav','.txt')
+        command = f"""{PHONEXIA_PATH}/sqestim -enable-pesq -c {PHONEXIA_PATH}/settings/sqestim.bs -i {filepath} -o {op_filename}"""
+
+        result = os.system(command)
+        if(result!=0):
+            #if there were some issue in the command execution
+            # logger.error(f"[{self.id}_{self.counter}_{self.test}]Error in the phonexia command execution..! try_cnt={try_cnt}")
+            if try_cnt==10:
+                return None
+            #let's try for 10 times
+            return get_phoneix_pesq_score(filepath,try_cnt+1)
+        
+        #let's read the output file generated through phonexia for the audio file
+        result = ''
+        try:
+            with open(op_filename,'r') as file:
+                result = file.readlines()
+        except Exception as e:
+            # logger.error(f"[{self.id}_{self.counter}_{self.test}]Exception while reading the {op_filename} file: {e}")
+            return None
+
+        #extracting pesq score from the output file
+        if len(result)>0 and 'pesq' in result[0] and 'value' in result[0]:
+            ph_score = result[0].split(',')[1].strip().split('=')[-1].strip()
+            if((ph_score)):
+                ph_score = float(ph_score)
+                #3.8 is starting point anything above is 4.4. Deviation to start with is 1.130 and for each next value we add 0.015
+                if(ph_score > 3.89):
+                    kc_score = 4.4
+                elif(ph_score < 3.89 and ph_score >=2):
+                    kc_score = ph_score * ((1.130 + (round(3.8-float(str(ph_score)[0:3]),1)*10)*0.015))
+                    if(kc_score > 4.4):
+                        kc_score = 4.4
+                elif(ph_score < 2 and ph_score > 1.76):
+                    kc_score = ph_score * 1.2
+                elif(ph_score < 1.76 and ph_score > 1):
+                    kc_score = ph_score * 1.135
+                else:
+                    kc_score = ph_score
+                # logger.info(f"[{self.id}_{self.counter}_{self.test}] Phonexia Score={ph_score} -- KC Score={kc_score}")
+                return float(kc_score)
+        #if pesq score not found in the output file then phonexia unabled to score that audio file.
+        # logger.error(f"[{self.id}_{self.counter}_{self.test}]Phonexia unable to process the audio file!")
+        return None
 
 def fuzzy_match(transcript, keywords, session):
     transcript = transcript.lower()
@@ -148,6 +204,281 @@ def is_speech_packet(payload):
     else:
         return False
     
+
+################################################
+# NODE-LEVEL RTP RECORDING + EXTERNAL MOS
+################################################
+
+def _safe_recording_component(value):
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
+    return cleaned.strip("_") or "unknown"
+
+
+def start_node_recording(session, node_id):
+    """
+    Start recording inbound G.711 mu-law RTP for one IVR node.
+
+    Final WAV filename:
+        <recording_session["call_id"]>_<node_id>.wav
+    """
+    stop_node_recording(session, run_mos=False)
+
+    recording_session = session.setdefault("recording_session", {})
+    call_id = _safe_recording_component(
+        recording_session.get(
+            "call_id",
+            session.get("call_id", session.get("caller_channel", "unknown"))
+        )
+    )
+    safe_node_id = _safe_recording_component(node_id)
+
+    os.makedirs(NODE_RECORDING_DIR, exist_ok=True)
+
+    base_name = f"{call_id}_{session['test_execution_row_id']}_{safe_node_id}"
+    raw_path = os.path.join(NODE_RECORDING_DIR, f"{base_name}.ulaw")
+    wav_path = os.path.join(NODE_RECORDING_DIR, f"{base_name}.wav")
+
+    raw_file = open(raw_path, "wb")
+
+    session["recording_session"] = {
+        "call_id": call_id,
+        "node_id": safe_node_id,
+        "raw_path": raw_path,
+        "wav_path": wav_path,
+        "file": raw_file,
+        "bytes_written": 0,
+        "started_at": time.monotonic(),
+        "active": True,
+    }
+
+    logger.info(
+        f"Node recording started: {wav_path}",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN"),
+        },
+    )
+
+    return wav_path
+
+
+def write_node_audio(session, ulaw_payload):
+    """Append one inbound RTP payload to the active node recording."""
+    recording = session.get("recording_session")
+
+    if not recording or not recording.get("active"):
+        return
+
+    raw_file = recording.get("file")
+    if raw_file is None:
+        return
+
+    try:
+        raw_file.write(ulaw_payload)
+        recording["bytes_written"] += len(ulaw_payload)
+    except Exception:
+        logger.exception(
+            "Failed writing node RTP audio",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+
+
+def _convert_ulaw_to_wav(raw_path, wav_path):
+    """Convert raw 8-kHz mono mu-law audio to 16-bit PCM WAV."""
+    with open(raw_path, "rb") as source:
+        ulaw_audio = source.read()
+
+    pcm_audio = audioop.ulaw2lin(ulaw_audio, 2)
+
+    with wave.open(wav_path, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(8000)
+        target.writeframes(pcm_audio)
+
+
+def run_external_mos(wav_path, session, node_id):
+    """
+    Run the configured external MOS command.
+
+    MOS_COMMAND placeholders:
+      {file}
+      {call_id}
+      {node_id}
+
+    Example:
+      export MOS_COMMAND='python3 /opt/mos/score.py --audio {file}'
+    """
+    if not MOS_COMMAND:
+        logger.info(
+            f"MOS command not configured; recording retained at {wav_path}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+        return None
+
+    call_id = session.get("recording_session", {}).get(
+        "call_id",
+        session.get("call_id", "unknown"),
+    )
+
+    command_text = MOS_COMMAND.format(
+        file=wav_path,
+        call_id=call_id,
+        node_id=node_id,
+    )
+
+    try:
+        result = subprocess.run(
+            shlex.split(command_text),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception:
+        logger.exception(
+            f"MOS command execution failed for {wav_path}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+        return None
+
+    if result.returncode != 0:
+        logger.info(
+            f"MOS command returned {result.returncode} for {wav_path}: "
+            f"{result.stderr.strip()}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+        return None
+
+    output = result.stdout.strip()
+
+    logger.info(
+        f"External MOS result for node {node_id}: {output}",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN"),
+        },
+    )
+
+    # Accept either a plain number or JSON-like/string output.
+    try:
+        return float(output)
+    except (TypeError, ValueError):
+        return output
+
+
+def stop_node_recording(session, run_mos=True):
+    """
+    Close the active node recording, convert it to WAV, and optionally run MOS.
+    """
+    recording = session.get("recording_session")
+
+    if not recording or not recording.get("active"):
+        return None
+
+    recording["active"] = False
+
+    raw_file = recording.get("file")
+    if raw_file is not None:
+        try:
+            raw_file.flush()
+            raw_file.close()
+        except Exception:
+            pass
+
+    raw_path = recording.get("raw_path")
+    wav_path = recording.get("wav_path")
+    node_id = recording.get("node_id", "unknown")
+    bytes_written = recording.get("bytes_written", 0)
+
+    if not raw_path or bytes_written == 0:
+        logger.info(
+            f"Node recording skipped; no RTP audio for node {node_id}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+
+        try:
+            if raw_path and os.path.exists(raw_path):
+                os.remove(raw_path)
+        except OSError:
+            pass
+
+        return None
+
+    try:
+        _convert_ulaw_to_wav(raw_path, wav_path)
+    except Exception:
+        logger.exception(
+            f"Node WAV conversion failed for {raw_path}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+        return None
+    finally:
+        try:
+            if raw_path and os.path.exists(raw_path):
+                os.remove(raw_path)
+        except OSError:
+            pass
+
+    duration_seconds = bytes_written / 8000.0
+
+    mos_result = None
+    if run_mos:
+        ph_score = get_phoneix_pesq_score(wav_path)
+        # mos_result = run_external_mos(
+        #     wav_path,
+        #     session,
+        #     node_id,
+        # )
+
+    result = {
+        "node_id": node_id,
+        "wav_path": wav_path,
+        "duration_seconds": round(duration_seconds, 3),
+        "mos_result": ph_score,
+    }
+
+    session["last_node_recording"] = result
+    session.setdefault("node_recordings", []).append(result)
+
+    logger.info(
+        f"Node recording completed: {result}",
+        extra={
+            "callid": session.get("call_id", "UNKNOWN"),
+            "testid": session.get("test_execution_row_id", "UNKNOWN"),
+        },
+    )
+
+    return result
+
+
+def switch_node_recording(session, next_node_id):
+    """
+    Finalize the current node recording and immediately start the next node.
+    """
+    completed = stop_node_recording(session, run_mos=True)
+    start_node_recording(session, next_node_id)
+    return completed
+
+
 ################################################
 # RTP Receiver (GLOBAL)
 ################################################
@@ -335,6 +666,7 @@ def rtp_receiver():
         #     # print("No stt ws available to send audio")
         #     logger.info(f"No stt ws available to send audio", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
 
+        write_node_audio(session, payload)
         send_audio_to_stt(session, payload)
 
     try:
@@ -1148,6 +1480,11 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         session["current_node_id"] = current_node.node_id
         session["expected_text"] = current_node.expected_text
 
+        completed_node_recording = stop_node_recording(
+            session,
+            run_mos=True
+        )
+
         # Replace {$variable} with value for Expected Text
         for var_name, var_value in session["captured_variables"].items():
             # placeholder = f"${{{var_name}}}" # to match variable like ${x}
@@ -1212,7 +1549,23 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
         # Use the actual voicebot media channel, not the ExternalMedia channel.
         rtp_stats = get_rtp_stats(session, session.get("voicebot_channel"))
         session["node_result"]["rtp_stats"] = rtp_stats
-        session["node_result"]["mos"] = estimate_mos_from_rtp_stats(rtp_stats)
+
+        external_mos = None
+        if completed_node_recording:
+            external_mos = completed_node_recording.get("mos_result")
+            session["node_result"]["recording_file"] = (
+                completed_node_recording.get("wav_path")
+            )
+            session["node_result"]["recording_duration"] = (
+                completed_node_recording.get("duration_seconds")
+            )
+
+        if isinstance(external_mos, (int, float)):
+            session["node_result"]["mos"] = round(float(external_mos), 2)
+        else:
+            session["node_result"]["mos"] = estimate_mos_from_rtp_stats(
+                rtp_stats
+            )
 
         logger.info(
             f"RTP Stats: {rtp_stats}, Estimated MOS: {session['node_result']['mos']}",
@@ -1322,6 +1675,11 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
             ):
                 return
 
+            start_node_recording(
+                session,
+                predicted_next_node.node_id
+            )
+
         if current_node.action_to_take.inject_type == "DTMF":
             send_dtmf(session, channel_id, current_node.action_to_take.value)
 
@@ -1370,6 +1728,18 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
                 session["prepared_stt_node_id"] = None
                 session["current_node_id"] = current_node.node_id
+
+                active_recording = session.get("recording_session", {})
+                if (
+                    not active_recording.get("active")
+                    or active_recording.get("node_id")
+                        != _safe_recording_component(current_node.node_id)
+                ):
+                    start_node_recording(
+                        session,
+                        current_node.node_id
+                    )
+
                 # Next node audio should be barged in after x seconds
                 if current_node and current_node.bargein_timeout is not None:
                     if current_node.bargein_timeout > 0:
@@ -1942,6 +2312,12 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
             # Node results
             "node_result": [],
             "node_results": [],
+            "recording_session": {
+                "call_id": sip_call_id,
+                "active": False
+            },
+            "last_node_recording": None,
+            "node_recordings": [],
 
             # Overall metrics
             "summary": {
@@ -1992,6 +2368,11 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
         if not ensure_stt_for_node(session, channel_id, current_node):
             return
+
+        start_node_recording(
+            session,
+            current_node.node_id
+        )
 
         # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
         #(f"[Exec:{session['test_execution_row_id']}] "
@@ -2564,6 +2945,17 @@ def cleanup_session_resources(session, remove_session=True):
     rtp_addr = session.get("rtp_addr")
 
     session["stt_accept_audio"] = False
+
+    try:
+        stop_node_recording(session, run_mos=True)
+    except Exception:
+        logger.exception(
+            "Failed finalizing node recording during cleanup",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
 
     try:
         stop_stt(stt_ws)
