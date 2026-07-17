@@ -210,7 +210,7 @@ def is_speech_packet(payload):
 ################################################
 
 def _safe_recording_component(value):
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value))
     return cleaned.strip("_") or "unknown"
 
 
@@ -224,24 +224,23 @@ def start_node_recording(session, node_id):
     stop_node_recording(session, run_mos=False)
 
     recording_session = session.setdefault("recording_session", {})
-    call_id = _safe_recording_component(
-        recording_session.get(
-            "call_id",
-            session.get("call_id", session.get("caller_channel", "unknown"))
-        )
-    )
+    # sip_call_id = _safe_recording_component(
+    #     recording_session.get("call_id",session.get("call_id", session.get("caller_channel", "unknown")))
+    # )
+
+    sip_call_id = session["sip_call_id"]
     safe_node_id = _safe_recording_component(node_id)
 
     os.makedirs(NODE_RECORDING_DIR, exist_ok=True)
 
-    base_name = f"{call_id}_{session['test_execution_row_id']}_{safe_node_id}"
+    base_name = f"{session['test_execution_row_id']}_{safe_node_id}_{sip_call_id}"
     raw_path = os.path.join(NODE_RECORDING_DIR, f"{base_name}.ulaw")
     wav_path = os.path.join(NODE_RECORDING_DIR, f"{base_name}.wav")
 
     raw_file = open(raw_path, "wb")
 
     session["recording_session"] = {
-        "call_id": call_id,
+        "call_id": sip_call_id,
         "node_id": safe_node_id,
         "raw_path": raw_path,
         "wav_path": wav_path,
@@ -260,7 +259,6 @@ def start_node_recording(session, node_id):
     )
 
     return wav_path
-
 
 def write_node_audio(session, ulaw_payload):
     """Append one inbound RTP payload to the active node recording."""
@@ -2369,10 +2367,10 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         if not ensure_stt_for_node(session, channel_id, current_node):
             return
 
-        start_node_recording(
-            session,
-            current_node.node_id
-        )
+        # start_node_recording(
+        #     session,
+        #     current_node.node_id
+        # )
 
         # logger.info(f"Stasis Start", extra={"callid":sip_call_id, "testid":session.get("test_execution_row_id", "UNKNOWN")})
         #(f"[Exec:{session['test_execution_row_id']}] "
@@ -2406,6 +2404,13 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
         session["bargein_timeout"] = session["initial_bargein_timeout"]
 
         session["sip_call_id"] = get_pjsip_call_id(channel_id)
+
+        current_node = session["test_case"].get_start_node()
+        # experimental
+        start_node_recording(
+            session,
+            current_node.node_id
+        )
 
         session["bot_connect_time"] = datetime.datetime.now()
         session["bot_answer_duration"] = session["bot_connect_time"] - session["bot_dial_time"]
