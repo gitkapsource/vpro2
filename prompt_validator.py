@@ -268,8 +268,20 @@ def _contains_wait_for_hangup_tag(template: str) -> bool:
 
 
 def _is_bargein_tag(tag_value: str) -> bool:
-    """True if this tag is {BargeIn} (case-insensitive, tolerant of stray spaces/hyphens)."""
-    return re.sub(r"[\s\-]", "", tag_value.strip().upper()) == "BARGEIN"
+    """
+    Return True for {BargeIn} and parameterised forms such as
+    {BargeIn after=9.9}. Matching is case-insensitive and tolerant of
+    spaces or hyphens in the tag name.
+    """
+    value = tag_value.strip()
+    if not value:
+        return False
+
+    # Only inspect the tag name; everything after the first whitespace is
+    # treated as optional BargeIn parameters.
+    tag_name = re.split(r"\s+", value, maxsplit=1)[0]
+    normalized_name = re.sub(r"[\s\-]", "", tag_name.upper())
+    return normalized_name == "BARGEIN"
 
 
 def _tag_to_regex(tag: str, language: str) -> str:
@@ -343,10 +355,11 @@ def build_regex(template: str, language: str = "en-US") -> str:
         if kind == "tag" and value.strip().upper() == "BYPASSRECOGNITION":
             frags.append(r"(?:.*)")
             break
-        # BargeIn: text before the tag is matched normally; text after it is
-        # dropped entirely (no audio exists past the barge-in point), so we
-        # add no fragment for it and stop — the anchor lands right here.
+        # BargeIn: text before the tag must match normally. Template text after
+        # the tag is ignored, and any additional actual transcript received at
+        # or after the barge-in boundary is also ignored.
         if kind == "tag" and _is_bargein_tag(value):
+            frags.append(r"(?:.*)")
             break
         if kind == "tag":
             frags.append(_tag_to_regex(value, language))
@@ -1103,6 +1116,11 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
 
     # Run partial scorer in all cases (gives us breakdown + captured variables)
     mc, total, breakdown, captured = _score_partial(units, actual)
+
+    # BargeIn changes the scoring contract to the template prefix only.
+    # Do not force a successful result merely because the tag exists. The
+    # normal full/partial scoring below decides the percentage using only the
+    # units extracted before the BargeIn tag; trailing actual speech is ignored.
 
     if full_match:
         # Rebuild breakdown to mark all scored units as matched (anchored pass)
