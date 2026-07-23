@@ -19,6 +19,7 @@ Supported tags (any combination):
   {BypassRecognition}        Always returns 100% match, ignores everything after it
   {BargeIn}                  Text before this tag is matched normally; template text after
                               it is dropped entirely (no audio exists past the barge-in point)
+  {WaitForHangup}             Control-only terminal tag; must be the complete field value
 
 match_percentage = matched_units / total_units × 100
   • {Optional} and {*}/{wildcard} are not counted in total_units
@@ -257,26 +258,18 @@ def _literal_to_regex(text: str) -> str:
     return esc
 
 
+def _is_wait_for_hangup_template(template: str) -> bool:
+    """Return True only for the exact, whitespace-free tag, case-insensitively."""
+    return bool(re.fullmatch(r"\{waitforhangup\}", template or "", re.IGNORECASE))
+
+
+def _contains_wait_for_hangup_tag(template: str) -> bool:
+    return bool(re.search(r"\{WaitForHangup\}", template, re.IGNORECASE))
+
+
 def _is_bargein_tag(tag_value: str) -> bool:
-    """
-    Return True for BargeIn control tags, including attributes.
-
-    Supported examples:
-      {BargeIn}
-      {BargeIn after=7.9}
-      {barge-in after=12.5}
-      {BargeIn timeout=5}
-    """
-    normalized = tag_value.strip()
-
-    # Match the tag name only; anything after it is treated as attributes.
-    return bool(
-        re.match(
-            r"^BARGE[\s\-]*IN(?:\s+.*)?$",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
+    """True if this tag is {BargeIn} (case-insensitive, tolerant of stray spaces/hyphens)."""
+    return re.sub(r"[\s\-]", "", tag_value.strip().upper()) == "BARGEIN"
 
 
 def _tag_to_regex(tag: str, language: str) -> str:
@@ -350,12 +343,10 @@ def build_regex(template: str, language: str = "en-US") -> str:
         if kind == "tag" and value.strip().upper() == "BYPASSRECOGNITION":
             frags.append(r"(?:.*)")
             break
-        # BargeIn: text before the tag must match normally. Everything after
-        # the tag in both the template and the actual transcript is ignored.
-        # The trailing .* lets an already-buffered STT transcript contain words
-        # beyond the barge-in point without causing the validation to fail.
+        # BargeIn: text before the tag is matched normally; text after it is
+        # dropped entirely (no audio exists past the barge-in point), so we
+        # add no fragment for it and stop — the anchor lands right here.
         if kind == "tag" and _is_bargein_tag(value):
-            frags.append(r"(?:.*)")
             break
         if kind == "tag":
             frags.append(_tag_to_regex(value, language))
@@ -1031,7 +1022,10 @@ def _word_match_percentage(expect_to_hear: str, actual: str, language: str = "en
 
 @dataclass
 class MatchResult:
-    word_match_percentage: float = 0.0
+    matched: bool                    # True only when full regex anchor passes (100%)
+    match_percentage: float          # existing unit/tag-based score, 0.0–100.0
+    word_match_percentage: float = 0.0  # literal word-based score, 0.0–100.0
+    pattern_used: str = ""           # anchored regex (for debugging)
     detail: str = ""
     breakdown: list = field(default_factory=list)
     captured_variables: dict = field(default_factory=dict)
@@ -1047,85 +1041,103 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
     """
     Validate *actual* against the *expect_to_hear* template.
 
-    The returned MatchResult contains only:
-      .word_match_percentage
-      .detail
-      .breakdown
-      .captured_variables
+    Returns MatchResult with:
+      .matched              True if 100% full-regex match
+      .match_percentage          0.0–100.0 unit/tag-based partial credit
+      .word_match_percentage     0.0–100.0 literal word-based partial credit
+      .breakdown                 [(label, matched, matched_text), ...]
+      .captured_variables   {varname: value} from Choice tags with variables
+      .pattern_used         full regex string
+      .detail               human-readable summary
     """
+    # WaitForHangup is a control step, not a speech-recognition contract.
+    # The call engine enforces last-step placement and timeout thresholds.
+    if _contains_wait_for_hangup_tag(expect_to_hear):
+        if not _is_wait_for_hangup_template(expect_to_hear):
+            return MatchResult(
+                matched=False,
+                match_percentage=0.0,
+                word_match_percentage=0.0,
+                pattern_used="<WaitForHangup-invalid>",
+                detail=(
+                    "{WaitForHangup} must be the only text in Expect to Hear "
+                    "with no leading or trailing spaces"
+                ),
+                breakdown=[("{WaitForHangup}", False, None)],
+            )
+        return MatchResult(
+            matched=True,
+            match_percentage=100.0,
+            word_match_percentage=100.0,
+            pattern_used="<WaitForHangup>",
+            detail="WaitForHangup control tag; speech recognition is not performed",
+            breakdown=[("{WaitForHangup}", True, "waiting for called-party hangup")],
+        )
+
     word_pct = _word_match_percentage(expect_to_hear, actual, language)
 
+    # ── BypassRecognition short-circuit ───────────────────────────────────────
+    # If the first meaningful tag is {BypassRecognition}, return 100% immediately.
     bypass_re = re.compile(r"\{BypassRecognition\}", re.IGNORECASE)
     if bypass_re.search(expect_to_hear):
+        bd = [("{BypassRecognition}", True, "bypassed — no recognition performed")]
         return MatchResult(
+            matched=True,
+            match_percentage=100.0,
             word_match_percentage=100.0,
+            pattern_used="<BypassRecognition>",
             detail="BypassRecognition tag present — automatic 100% match",
-            breakdown=[
-                (
-                    "{BypassRecognition}",
-                    True,
-                    "bypassed — no recognition performed"
-                )
-            ],
+            breakdown=bd,
         )
 
     pattern = build_regex(expect_to_hear, language)
-    units = _extract_scored_units(expect_to_hear, language)
+    units   = _extract_scored_units(expect_to_hear, language)
 
+    # ── Full match ────────────────────────────────────────────────────────────
     try:
-        full_match = bool(
-            re.match(
-                pattern,
-                actual.strip(),
-                re.DOTALL | re.IGNORECASE
-            )
-        )
+        full_match = bool(re.match(pattern, actual.strip(), re.DOTALL | re.IGNORECASE))
     except re.error as exc:
-        return MatchResult(
-            word_match_percentage=word_pct,
-            detail=f"Regex error: {exc}",
-        )
+        return MatchResult(matched=False, match_percentage=0.0,
+                           word_match_percentage=word_pct,
+                           pattern_used=pattern, detail=f"Regex error: {exc}")
 
-    matched_units, total_units, breakdown, captured = _score_partial(
-        units,
-        actual
-    )
+    # Run partial scorer in all cases (gives us breakdown + captured variables)
+    mc, total, breakdown, captured = _score_partial(units, actual)
 
     if full_match:
-        successful_breakdown = [
-            (label, True, matched_text)
-            for label, _, matched_text in breakdown
-        ]
-
+        # Rebuild breakdown to mark all scored units as matched (anchored pass)
+        bd = [(label, True, text) for label, _, text in breakdown]
         return MatchResult(
-            word_match_percentage=100.0,
-            detail="Full match (100%)",
-            breakdown=successful_breakdown,
-            captured_variables=captured,
+            matched=True, match_percentage=100.0,
+            word_match_percentage=word_pct,
+            pattern_used=pattern, detail="Full match (100%)",
+            breakdown=bd, captured_variables=captured,
         )
 
-    unit_percentage = (
-        round(matched_units / total_units * 100, 1)
-        if total_units
-        else 0.0
-    )
-
-    failed = [
-        label
-        for label, unit_matched, _ in breakdown
-        if not unit_matched
-    ]
-
+    pct = round(mc / total * 100, 1) if total else 0.0
+    failed = [lbl for lbl, ok, _ in breakdown if not ok]
     detail = (
-        f"Partial match {unit_percentage}% — "
-        f"{matched_units}/{total_units} units matched. "
+        f"Partial match {pct}% — {mc}/{total} units matched. "
         f"Unmatched: {failed}"
-        if failed
-        else f"Partial match {unit_percentage}%"
+        if failed else f"Partial match {pct}%"
     )
 
+    # return MatchResult(
+    #     matched=False, match_percentage=pct,
+    #     word_match_percentage=word_pct,
+    #     pattern_used=pattern, detail=detail,
+    #     breakdown=breakdown, captured_variables=captured,
+    # )
+
+    # Important:
+    # .matched means the full anchored template matched.
+    # Do not mark .matched=True merely because word_match_percentage crosses
+    # an acceptance threshold; threshold decisions should be made by the caller.
     return MatchResult(
+        matched=False,
+        match_percentage=pct,
         word_match_percentage=word_pct,
+        pattern_used=pattern,
         detail=detail,
         breakdown=breakdown,
         captured_variables=captured,
@@ -1137,21 +1149,23 @@ def validate(expect_to_hear: str, actual: str, language: str = "en-US") -> Match
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_result(result: MatchResult, eth: str = "", actual: str = ""):
+    bar_width = 30
+    filled = int(result.match_percentage / 100 * bar_width)
+    bar = "█" * filled + "░" * (bar_width - filled)
+
     print(f"  Template  : {eth}")
     print(f"  Actual    : {actual}")
+    print(f"  Match     : [{bar}] {result.match_percentage:.1f}%  "
+          f"{'✓ FULL MATCH' if result.matched else '✗ PARTIAL/NO MATCH'}")
     print(f"  Word Match: {result.word_match_percentage:.1f}%")
-    print(f"  Detail    : {result.detail}")
-
     if result.captured_variables:
         print(f"  Captured  : {result.captured_variables}")
-
     if result.breakdown:
         print("  Breakdown :")
-        for label, matched, matched_text in result.breakdown:
-            icon = "  ✓" if matched else "  ✗"
-            found = f'  → "{matched_text}"' if matched_text else ""
+        for label, ok, text in result.breakdown:
+            icon   = "  ✓" if ok else "  ✗"
+            found  = f'  → "{text}"' if text else ""
             print(f"    {icon}  {label}{found}")
-
     print()
 
 
@@ -1160,46 +1174,158 @@ def print_result(result: MatchResult, eth: str = "", actual: str = ""):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run_tests():
+    PASS = "\033[92mPASS\033[0m"
+    FAIL = "\033[91mFAIL\033[0m"
+
+    # (eth, actual, lang, exp_matched, exp_pct, exp_captured)
     cases = [
-        (
-            "Welcome to the bank. {BargeIn} Please hold while we transfer you",
-            "Welcome to the bank. extra words received after barge in",
-            100.0,
-        ),
-        (
-            "Your PIN is {Digits Length=4}. {BargeIn} Thank you for calling",
-            "Your PIN is 1 2 3 4. extra transcript",
-            100.0,
-        ),
-        (
-            "{BypassRecognition}",
-            "anything at all",
-            100.0,
-        ),
-        (
-            "Your balance is {Currency}",
-            "Your balance is twenty dollars",
-            100.0,
-        ),
+        # ── Basic tag tests ───────────────────────────────────────────────────
+        ("The date today is the {Date}",
+         "The date today is the 4th of June 2014", "en-US", True, 100.0, {}),
+        ("Your credit card will expire {Date}",
+         "Your credit card will expire tomorrow", "en-US", True, 100.0, {}),
+        ("At the third tone the time will be {Time} precisely",
+         "At the third tone the time will be 12:24pm precisely", "en-US", True, 100.0, {}),
+        ("Opening times are from {Time} till {Time} each weekday",
+         "Opening times are from 9:30am till 5:30pm each weekday", "en-US", True, 100.0, {}),
+        ("There are {Number} products available",
+         "There are One Thousand and Four products available", "en-US", True, 100.0, {}),
+
+        # ── AlphaNum exact length ─────────────────────────────────────────────
+        ("Your postcode is {AlphaNum Length=6}",
+         "Your postcode is K 2 G 4 A 3", "en-US", True, 100.0, {}),
+        ("Your postcode is {AlphaNum Length=6}",
+         "Your postcode is K 2 G 4 A",   "en-US", False, 50.0, {}),   # 5 tokens — too short
+        ("Your postcode is {AlphaNum Length=6}",
+         "Your postcode is K 2 G 4 A 3 X", "en-US", False, 50.0, {}), # 7 tokens — too long
+        ("Code is {AlphaNum Length=4-6}",
+         "Code is A B C D E", "en-US", True, 100.0, {}),               # 5, in range
+        ("Code is {AlphaNum Length=4-6}",
+         "Code is A B C", "en-US", False, 50.0, {}),                   # 3, too short
+        ("Code is {AlphaNum Length=4-6}",
+         "Code is A B C D E F G", "en-US", False, 50.0, {}),           # 7, too long
+
+        # ── Digits exact length ───────────────────────────────────────────────
+        ("Your telephone account PIN is {Digits Length=4}",
+         "Your telephone account PIN is 9 8 9 8", "en-US", True, 100.0, {}),
+        ("Your telephone account PIN is {Digits Length=4}",
+         "Your telephone account PIN is 9 8 9 8 7", "en-US", False, 50.0, {}),  # 5 digits
+        ("Your telephone account PIN is {Digits Length=4-6}",
+         "Your telephone account PIN is 9 8 9 8 7", "en-US", True, 100.0, {}),
+
+        # ── Choice with variable capture ──────────────────────────────────────
+        ("Good {Choice x=morning:1|afternoon:2|evening:3}, welcome.",
+         "Good afternoon, welcome.", "en-US", True, 100.0, {"x": "2"}),
+        ("Good {Choice x=morning:1|afternoon:2|evening:3}, welcome.",
+         "Good morning, welcome.", "en-US", True, 100.0, {"x": "1"}),
+        ("Please enter your {Choice digit=first:1|second:2|third:3} digit.",
+         "Please enter your second digit.", "en-US", True, 100.0, {"digit": "2"}),
+        # Choice without variable
+        ("Good {Choice morning|afternoon|evening}, welcome to A B C Bank.",
+         "Good afternoon, welcome to A B C Bank.", "en-US", True, 100.0, {}),
+        ("Good {Choice morning|afternoon|evening}, welcome to A B C Bank.",
+         "Good night, welcome to A B C Bank.", "en-US", False, None, {}),
+        # Choice with dot (empty alternative)
+        ("Welcome. {Choice Our office is now closed.|.} For banking, press 1.",
+         "Welcome. Our office is now closed. For banking, press 1.", "en-US", True, 100.0, {}),
+        ("Welcome. {Choice Our office is now closed.|.} For banking, press 1.",
+         "Welcome. For banking, press 1.", "en-US", True, 100.0, {}),
+
+        # ── BypassRecognition ─────────────────────────────────────────────────
+        ("{BypassRecognition}",
+         "anything at all", "en-US", True, 100.0, {}),
+        ("{BypassRecognition} This is a comment about what we are bypassing",
+         "some audio we don't care about", "en-US", True, 100.0, {}),
+        ("Hello. {BypassRecognition} ignore rest",
+         "completely different text", "en-US", True, 100.0, {}),
+
+        # ── BargeIn ───────────────────────────────────────────────────────────
+        # Text before the tag must still match normally; text after it in the
+        # template is dropped — there's no audio for it past the barge-in point.
+        ("Welcome to the bank. {BargeIn} Please hold while we transfer you",
+         "Welcome to the bank.", "en-US", True, 100.0, {}),
+        ("Welcome to the bank. {BargeIn} Please hold while we transfer you",
+         "Welcome to the wrong place.", "en-US", False, 0.0, {}),
+        ("Your PIN is {Digits Length=4}. {BargeIn} Thank you for calling",
+         "Your PIN is 1 2 3 4.", "en-US", True, 100.0, {}),
+        ("Your PIN is {Digits Length=4}. {BargeIn} Thank you for calling",
+         "Your PIN is 1 2 3.", "en-US", False, 50.0, {}),
+        ("Good {Choice morning|afternoon|evening}, your balance is {BargeIn} due in full",
+         "Good afternoon, your balance is", "en-US", True, 100.0, {}),
+
+        # ── Wildcard ──────────────────────────────────────────────────────────
+        ("{*} Your balance is {Currency} rupees",
+         "Your balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Hello {*} balance is {Currency} rupees",
+         "Hello sir balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Call {*} on {Date} at {Time}",
+         "Call us on June 4th at 9:30am", "en-US", True, 100.0, {}),
+        ("Your PIN is {Digits Length=4} {*}",
+         "Your PIN is 1 2 3 4 extra stuff", "en-US", True, 100.0, {}),
+        ("Account {Digits Length=4} {*} expires {Date}",
+         "Account 1 2 3 4 NOISE expires tomorrow", "en-US", True, 100.0, {}),
+
+        # ── {wildcard} as alias for {*} ──────────────────────────────────────
+        ("{wildcard} Your balance is {Currency} rupees",
+         "Your balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Hello {wildcard} balance is {Currency} rupees",
+         "Hello sir balance is twenty rupees", "en-US", True, 100.0, {}),
+        ("Call {Wildcard} on {Date} at {Time}",
+         "Call us on June 4th at 9:30am", "en-US", True, 100.0, {}),
+        ("Your PIN is {Digits Length=4} {WILDCARD}",
+         "Your PIN is 1 2 3 4 extra stuff", "en-US", True, 100.0, {}),
+
+        # ── Combinations ─────────────────────────────────────────────────────
+        ("Your PIN is {Digits Length=4} and your account ends in {Digits Length=4}",
+         "Your PIN is 1 2 3 4 and your account ends in 5 6 7 8", "en-US", True, 100.0, {}),
+        ("Good {Choice x=morning:1|afternoon:2|evening:3}, your {Number} transactions total {Currency} as of {Date}",
+         "Good evening, your five transactions total twenty dollars and zero cents as of today",
+         "en-US", True, 100.0, {"x": "3"}),
+
+        # ── Partial match ─────────────────────────────────────────────────────
+        ("Your balance of {Currency} is due on {Date}",
+         "Your balance of BLAH BLAH is due on tomorrow", "en-US", False, 75.0, {}),
+        ("Call on {Date} at {Time}",
+         "Call on NOTHING at NOTHING", "en-US", False, 50.0, {}),
     ]
 
+    print("=" * 76)
+    print("  Prompt Validator — Full Test Suite")
+    print("=" * 76)
+
     passed = 0
+    for i, row in enumerate(cases, 1):
+        eth, actual, lang, exp_match, exp_pct, exp_cap = row
+        result = validate(eth, actual, lang)
 
-    for template, actual, expected_word_pct in cases:
-        result = validate(template, actual)
+        match_ok = result.matched == exp_match
+        pct_ok   = (exp_pct is None) or (result.match_percentage == exp_pct)
+        cap_ok   = (exp_cap == {} ) or (result.captured_variables == exp_cap)
+        ok       = match_ok and pct_ok and cap_ok
 
-        if result.word_match_percentage == expected_word_pct:
+        if ok:
             passed += 1
-            status = "PASS"
-        else:
-            status = "FAIL"
+        status   = PASS if ok else FAIL
+        pct_note = f"{result.match_percentage:.1f}%"
+        if not pct_ok:
+            pct_note += f"  (expected {exp_pct}%)"
+        cap_note = f"  captured={result.captured_variables}" if result.captured_variables else ""
 
-        print(
-            f"{status}: {template!r} -> "
-            f"{result.word_match_percentage:.1f}%"
-        )
+        print(f"\n[{i:02d}] {status}  lang={lang}  full={result.matched}  pct={pct_note}{cap_note}")
+        print(f"     ETH    : {eth}")
+        print(f"     Actual : {actual}")
+        if not ok:
+            print(f"     Detail : {result.detail}")
+            if not cap_ok:
+                print(f"     Expected captured: {exp_cap}  got: {result.captured_variables}")
+            for lbl, unit_ok, text in result.breakdown:
+                icon = "✓" if unit_ok else "✗"
+                snip = f' → "{text}"' if text else ""
+                print(f"             {icon} {lbl}{snip}")
 
-    print(f"Results: {passed}/{len(cases)} passed")
+    print("\n" + "=" * 76)
+    print(f"  Results: {passed}/{len(cases)} passed")
+    print("=" * 76)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

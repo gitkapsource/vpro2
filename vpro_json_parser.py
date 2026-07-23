@@ -4,6 +4,17 @@ from dataclasses import dataclass
 from typing import Optional, Dict
 
 BARGEIN_RE = re.compile(r"\{\s*barge\s*-?\s*in\s*(?:after\s*=\s*(\d+(?:\.\d+)?))?\s*\}", re.I)
+WAIT_FOR_HANGUP_TAG = "{WaitForHangup}"
+WAIT_FOR_HANGUP_RE = re.compile(r"\{waitforhangup\}", re.IGNORECASE)
+WAIT_FOR_HANGUP_EXACT_RE = re.compile(r"^\{waitforhangup\}$", re.IGNORECASE)
+
+
+def contains_wait_for_hangup(expected_text):
+    return bool(WAIT_FOR_HANGUP_RE.search(expected_text or ""))
+
+
+def is_wait_for_hangup(expected_text):
+    return bool(WAIT_FOR_HANGUP_EXACT_RE.fullmatch(expected_text or ""))
 
 def get_bargein_seconds(expected_text, default=0):
     m = BARGEIN_RE.search(expected_text or "")
@@ -42,6 +53,7 @@ class Node:
     major_confidence_level: float
     extended_attributes: Optional[Extended_Attributes]
     bargein_timeout: float
+    wait_for_hangup: bool
     
 @dataclass
 class Meta:
@@ -133,10 +145,58 @@ class IVRTestCase:
                 major_confidence_level=node_data["major_confidence_level"],
                 extended_attributes=extended_attributes,
                 transitions=node_data.get("transitions", {}),
-                bargein_timeout=get_bargein_seconds(node_data["expected_text"])
+                bargein_timeout=get_bargein_seconds(node_data["expected_text"]),
+                wait_for_hangup=is_wait_for_hangup(node_data["expected_text"])
             )
 
             self.nodes[node_id] = node
+
+        self._validate_wait_for_hangup_nodes()
+
+    def _validate_wait_for_hangup_nodes(self):
+        tagged_nodes = []
+        for node in self.nodes.values():
+            if contains_wait_for_hangup(node.expected_text):
+                if not node.wait_for_hangup:
+                    raise ValueError(
+                        f"Node {node.node_id}: {{WaitForHangup}} must be the only "
+                        "text in Expect to Hear with no leading or trailing spaces"
+                    )
+                tagged_nodes.append(node)
+
+        if len(tagged_nodes) > 1:
+            raise ValueError("{WaitForHangup} can appear on only one terminal step")
+        if not tagged_nodes:
+            return
+
+        node = tagged_nodes[0]
+        transitions = node.transitions or {}
+        has_outgoing = (
+            any(value not in (None, "", "0000", 0) for value in transitions.values())
+            if isinstance(transitions, dict)
+            else bool(transitions)
+        )
+        if has_outgoing:
+            raise ValueError(
+                f"Node {node.node_id}: {{WaitForHangup}} is allowed only on the last step"
+            )
+        if node.action_to_take is not None:
+            raise ValueError(
+                f"Node {node.node_id}: {{WaitForHangup}} step cannot contain an action"
+            )
+
+        try:
+            minor = float(node.minor_threshold_time)
+            major = float(node.major_threshold_time)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Node {node.node_id}: minor and major thresholds must be numeric seconds"
+            ) from exc
+        if minor < 0 or major <= 0 or minor > major:
+            raise ValueError(
+                f"Node {node.node_id}: thresholds must satisfy "
+                "0 <= minor <= major and major > 0"
+            )
 
     def get_node(self, node_id):
 

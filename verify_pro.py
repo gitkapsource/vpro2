@@ -77,6 +77,8 @@ logger.addHandler(
 ###########################################################
 
 #phonexia config
+
+PHONEXIA_ENABLED = 0
 PHONEXIA_PATH = "/usr/src/scripts/phonexia/SQE-D1-cmd-3.50.5-lin64"
 
 NODE_TEST_FAILED = 0
@@ -126,7 +128,7 @@ keywords_list = {
         # "automated"
 }
 
-def get_phoneix_pesq_score(filepath,try_cnt=1):
+def get_phoneix_pesq_score(session, filepath,try_cnt=1):
         filename = filepath.split('/')[-1]
         op_filename = '/tmp/'+filename.replace('.wav','.txt')
         command = f"""{PHONEXIA_PATH}/sqestim -enable-pesq -c {PHONEXIA_PATH}/settings/sqestim.bs -i {filepath} -o {op_filename}"""
@@ -135,10 +137,18 @@ def get_phoneix_pesq_score(filepath,try_cnt=1):
         if(result!=0):
             #if there were some issue in the command execution
             # logger.error(f"[{self.id}_{self.counter}_{self.test}]Error in the phonexia command execution..! try_cnt={try_cnt}")
+            logger.info(
+                f"Phonexia Command {command} result: {result}",
+                extra={
+                    "callid": session.get("call_id", "UNKNOWN"),
+                    "testid": session.get("test_execution_row_id", "UNKNOWN"),
+                },
+            )
+
             if try_cnt==10:
                 return None
             #let's try for 10 times
-            return get_phoneix_pesq_score(filepath,try_cnt+1)
+            return get_phoneix_pesq_score(session, filepath,try_cnt+1)
         
         #let's read the output file generated through phonexia for the audio file
         result = ''
@@ -168,6 +178,13 @@ def get_phoneix_pesq_score(filepath,try_cnt=1):
                 else:
                     kc_score = ph_score
                 # logger.info(f"[{self.id}_{self.counter}_{self.test}] Phonexia Score={ph_score} -- KC Score={kc_score}")
+                logger.info(
+                    f"Phonexia Score={ph_score} -- KC Score={kc_score}",
+                    extra={
+                        "callid": session.get("call_id", "UNKNOWN"),
+                        "testid": session.get("test_execution_row_id", "UNKNOWN"),
+                    },
+                )
                 return float(kc_score)
         #if pesq score not found in the output file then phonexia unabled to score that audio file.
         # logger.error(f"[{self.id}_{self.counter}_{self.test}]Phonexia unable to process the audio file!")
@@ -440,18 +457,22 @@ def stop_node_recording(session, run_mos=True):
 
     mos_result = None
     if run_mos:
-        ph_score = get_phoneix_pesq_score(wav_path)
-        # mos_result = run_external_mos(
-        #     wav_path,
-        #     session,
-        #     node_id,
-        # )
+        if PHONEXIA_ENABLED:
+            mos_score = get_phoneix_pesq_score(session, wav_path)
+        else:
+            mos_result = run_external_mos(
+                wav_path,
+                session,
+                node_id,
+            )
+            mos_score = 4
+        
 
     result = {
         "node_id": node_id,
         "wav_path": wav_path,
         "duration_seconds": round(duration_seconds, 3),
-        "mos_result": ph_score,
+        "mos_result": mos_score,
     }
 
     session["last_node_recording"] = result
@@ -1442,6 +1463,121 @@ def process_nodedata_safe(*args):
         )
 
 
+WAIT_FOR_HANGUP_TAG = "{WaitForHangup}"
+WAIT_FOR_HANGUP_RE = re.compile(r"^\{waitforhangup\}$", re.IGNORECASE)
+
+
+def is_wait_for_hangup_node(node):
+    expected_text = getattr(node, "expected_text", None) if node else None
+    return bool(WAIT_FOR_HANGUP_RE.fullmatch(expected_text or ""))
+
+
+def _record_wait_for_hangup_result(session, elapsed, result_code, reason):
+    node_id = session.get("wait_for_hangup_node_id")
+    node = session["test_case"].get_node(node_id)
+    match_result = validate_prompts(WAIT_FOR_HANGUP_TAG, "")
+
+    session["node_result"] = {
+        "node_id": node_id,
+        "expected_text": WAIT_FOR_HANGUP_TAG,
+        "actual_text": "",
+        "transcription_match": 100.0,
+        "response_time": round(elapsed, 3),
+        "test_result": json.dumps(asdict(match_result), ensure_ascii=False),
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "node_test_response_time": result_code,
+        "node_test_match_percentage": NODE_TEST_SUCCESS,
+        "node_test_result": result_code,
+        "rtp_stats": None,
+        "mos": 0.0,
+        "wait_for_hangup_reason": reason,
+    }
+    session.setdefault("node_results", []).append(dict(session["node_result"]))
+    record_test_history(session)
+
+
+def complete_wait_for_hangup(session, called_party_hung_up):
+    lock = session.setdefault("wait_for_hangup_lock", threading.Lock())
+    with lock:
+        if not session.get("wait_for_hangup_active"):
+            return False
+        elapsed = max(0.0, time.monotonic() - session["wait_for_hangup_started_at"])
+        minor = session["wait_for_hangup_minor"]
+        major = session["wait_for_hangup_major"]
+
+        if called_party_hung_up and elapsed <= minor:
+            code, reason = NODE_TEST_SUCCESS, "called party hung up within minor threshold"
+        elif called_party_hung_up and elapsed <= major:
+            code, reason = NODE_TEST_SATISFACTORY, "called party hung up between minor and major thresholds"
+        else:
+            code, reason = NODE_TEST_FAILED, "major threshold expired before called-party hangup"
+
+        session["wait_for_hangup_active"] = False
+        session["wait_for_hangup_completed"] = True
+        session["wait_for_hangup_result"] = code
+        _record_wait_for_hangup_result(session, elapsed, code, reason)
+
+        logger.info(
+            f"WaitForHangup completed after {elapsed:.3f}s; result={code}; reason={reason}",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        return True
+
+
+def _wait_for_hangup_watchdog(session, channel_id):
+    deadline = session["wait_for_hangup_started_at"] + session["wait_for_hangup_major"]
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    if complete_wait_for_hangup(session, called_party_hung_up=False):
+        logger.info(
+            "WaitForHangup major threshold exceeded; Platform is terminating the call",
+            extra={"callid": session.get("call_id", "UNKNOWN"),
+                   "testid": session.get("test_execution_row_id", "UNKNOWN")}
+        )
+        hangup_channel(session, channel_id)
+
+
+def begin_wait_for_hangup(session, node, channel_id):
+    if not is_wait_for_hangup_node(node):
+        return False
+
+    # No STT, PSST, or step recording applies to this control step.
+    session["stt_accept_audio"] = False
+    stop_stt(session.get("stt_ws"))
+    session["stt_ws"] = None
+    session["stt_generation"] = session.get("stt_generation", 0) + 1
+    stop_node_recording(session, run_mos=False)
+
+    session["current_node_id"] = node.node_id
+    session["expected_text"] = WAIT_FOR_HANGUP_TAG
+    session["wait_for_hangup_node_id"] = node.node_id
+    session["wait_for_hangup_minor"] = float(node.minor_threshold_time)
+    session["wait_for_hangup_major"] = float(node.major_threshold_time)
+    session["wait_for_hangup_started_at"] = time.monotonic()
+    session.setdefault("wait_for_hangup_lock", threading.Lock())
+    session["wait_for_hangup_active"] = True
+    session["wait_for_hangup_completed"] = False
+    session["node_transition"] = 0
+
+    logger.info(
+        f"WaitForHangup started for node {node.node_id}; "
+        f"minor={session['wait_for_hangup_minor']}s, "
+        f"major={session['wait_for_hangup_major']}s",
+        extra={"callid": session.get("call_id", "UNKNOWN"),
+               "testid": session.get("test_execution_row_id", "UNKNOWN")}
+    )
+
+    threading.Thread(
+        target=_wait_for_hangup_watchdog,
+        args=(session, channel_id),
+        daemon=True,
+        name=f"wait-hangup-{session.get('call_id', 'unknown')}"
+    ).start()
+    return True
+
+
 def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_id):
 
     #expected_prompt = "welcome to the {choice x=automated:1|manual:2} ivr testing system please listen carefully to the following options press {Digits} one for account information press two for technical support press three for payment services press nine to repeat this menu press zero to exit{*}"
@@ -1477,6 +1613,9 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
 
         session["current_node_id"] = current_node.node_id
         session["expected_text"] = current_node.expected_text
+
+        if begin_wait_for_hangup(session, current_node, channel_id):
+            return
 
         completed_node_recording = stop_node_recording(
             session,
@@ -1612,6 +1751,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                     logger.info(f"Next Node ID: {next_node_id}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
                     current_node = session["test_case"].get_node(next_node_id)
                     if current_node:
+                        if begin_wait_for_hangup(session, current_node, channel_id):
+                            return
                         if not reset_stt_for_node(
                             session,
                             parent_channel_id,
@@ -1665,7 +1806,7 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
                    "testid": session.get("test_execution_row_id", "UNKNOWN")}
         )
 
-        if predicted_next_node:
+        if predicted_next_node and not is_wait_for_hangup_node(predicted_next_node):
             if not reset_stt_for_node(
                 session,
                 parent_channel_id,
@@ -1716,6 +1857,8 @@ def process_nodedata(transcript_text, base_filename, channel_id, parent_channel_
            
             current_node = session["test_case"].get_node(next_node_id)
             if current_node:
+                if begin_wait_for_hangup(session, current_node, channel_id):
+                    return
                 if session.get("prepared_stt_node_id") != current_node.node_id:
                     if not reset_stt_for_node(
                         session,
@@ -2208,6 +2351,13 @@ def on_ari(ws, message):
             print("Session not found")
             return
 
+        ended_channel_id = event["channel"]["id"]
+        if (
+            session.get("wait_for_hangup_active")
+            and ended_channel_id == session.get("voicebot_channel")
+        ):
+            complete_wait_for_hangup(session, called_party_hung_up=True)
+
         # Clean-up Channel objects and data
         threading.Thread(
             target=handle_stasis_end,
@@ -2444,6 +2594,7 @@ def handle_stasis_start(event, channel_id, channel_name, parent_channel):
 
 def load_test_case(session): #, json_file="ivr_test.json"):
     # Load and Parse ivr_test.json Test Case File
+    test_case = None
     try:
         test_case = json_parse(session)
         # test_case = json_file_parse(session)
@@ -2529,7 +2680,14 @@ def load_test_case(session): #, json_file="ivr_test.json"):
                 break
             
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logger.exception(
+            f"Unable to load test case: {e}",
+            extra={
+                "callid": session.get("call_id", "UNKNOWN"),
+                "testid": session.get("test_execution_row_id", "UNKNOWN"),
+            },
+        )
+        return None
 
     return test_case
 
@@ -2824,10 +2982,85 @@ def record_test_history(session):
 ################################################
 # UPDATE TEST HISTORY INTO THE DATABASE
 ################################################
+# def update_test_history(session, stage=0):
+
+#     try:
+#         if stage == 0:
+#             sql = f""" 
+#                     UPDATE kcdb.verify_pro_test_execution_row_history
+#                     SET
+#                     start_time = %s,
+#                     connect_time = %s,
+#                     pdd = %s,
+#                     callid = %s,
+#                     execution_status = %s
+#                     WHERE
+#                     id = %s
+#                     """
+#                     # end_time = %s,
+#                     # call_ended_by = %d,
+
+#             conn = get_db_conn()
+#             cursor = conn.cursor()
+#             logger.info(f"Update Test Row Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+#             # 4. Execute the query
+#             cursor.execute(sql,
+#                 (
+#                 session["bot_dial_time"], 
+#                 session["bot_connect_time"], 
+#                 session["pdd"],
+#                 session["call_id"],
+#                 2, # Executing
+#                 session["test_execution_row_id"]
+#                 ))
+#         else:
+#             sql = f""" 
+#                     UPDATE kcdb.verify_pro_test_execution_row_history
+#                     SET
+#                     end_time = %s,
+#                     call_ended_by = %s,
+#                     execution_status = %s,
+#                     callid=%s
+#                     WHERE
+#                     id = %s
+#                     """
+
+#             conn = get_db_conn()
+#             cursor = conn.cursor()
+#             logger.info(f"Update Test Row Data : {sql}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+#             # 4. Execute the query
+#             cursor.execute(sql,
+#                 (
+#                 session["bot_end_time"],
+#                 session["call_ended_by"], 
+#                 3, # Completed
+#                 session["sip_call_id"],
+#                 session["test_execution_row_id"]
+#                 ))
+                
+#         # 5. COMMIT THE TRANSACTION (Crucial for INSERT, UPDATE, DELETE)
+#         conn.commit()
+
+#         # 6. Get the auto-incremented ID (Optional)
+#         logger.info(f"Successfully updated. Updated Row ID: {cursor.lastrowid}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+#     except Exception as err:
+#         print(f"Error: {err}")
+#         conn.rollback() # Undo changes if an error happens
+
+#     finally:
+#         # 7. Close connections
+#         cursor.close()
+#         conn.close()
+
 def update_test_history(session, stage=0):
 
     try:
+
         if stage == 0:
+            EXECUTION_STATUS = 2 # Executing
             sql = f""" 
                     UPDATE kcdb.verify_pro_test_execution_row_history
                     SET
@@ -2853,16 +3086,39 @@ def update_test_history(session, stage=0):
                 session["bot_connect_time"], 
                 session["pdd"],
                 session["call_id"],
-                2, # Executing
+                EXECUTION_STATUS,
                 session["test_execution_row_id"]
                 ))
         else:
+
+            EXECUTION_STATUS = 0
+            FAIL_TYPE=0
+            TEST_RESULT = 0
+
+            if session["summary"]["node_test_match_percentage"] == NODE_TEST_FAILED:
+                FAIL_TYPE = 31
+            elif session["summary"]["node_test_response_time"] == NODE_TEST_FAILED:
+                FAIL_TYPE = 32
+
+            TEST_RESULT = min(session["summary"]["node_test_match_percentage"], session["summary"]["node_test_response_time"])
+
+            logger.info(f"Final Update Test Row History Table:", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+            logger.info(f"FAIL_TYPE: {FAIL_TYPE} MATCH_%: {session['summary']['node_test_match_percentage']} RESP_TIME: {session['summary']['node_test_response_time']} TEST_RESULT: {TEST_RESULT}", extra={"callid":session.get("call_id", "UNKNOWN"),"testid":session.get("test_execution_row_id", "UNKNOWN")})
+
+            if TEST_RESULT == NODE_TEST_FAILED:
+                EXECUTION_STATUS = 5
+            elif TEST_RESULT == NODE_TEST_SATISFACTORY:
+                EXECUTION_STATUS = 4
+            else:
+                EXECUTION_STATUS = 3
+                
             sql = f""" 
                     UPDATE kcdb.verify_pro_test_execution_row_history
                     SET
                     end_time = %s,
                     call_ended_by = %s,
                     execution_status = %s,
+                    fail_type_id = %s,
                     callid=%s
                     WHERE
                     id = %s
@@ -2877,7 +3133,8 @@ def update_test_history(session, stage=0):
                 (
                 session["bot_end_time"],
                 session["call_ended_by"], 
-                3, # Completed
+                EXECUTION_STATUS, # Completed
+                None if FAIL_TYPE == 0 else FAIL_TYPE,
                 session["sip_call_id"],
                 session["test_execution_row_id"]
                 ))
@@ -2896,6 +3153,7 @@ def update_test_history(session, stage=0):
         # 7. Close connections
         cursor.close()
         conn.close()
+
 
 ################################################
 # APPLICATION SHUTDOWN + ARI CLEANUP
